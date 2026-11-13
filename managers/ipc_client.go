@@ -8,6 +8,7 @@ import (
 
 	"github.com/fosrl/newt/logger"
 	"github.com/fosrl/windows-linux/fingerprint"
+	"github.com/fosrl/windows-linux/logging"
 	"github.com/fosrl/windows-linux/updater"
 	"github.com/fosrl/windows-linux/managers/secretstore"
 	"github.com/fosrl/windows-linux/tunnel"
@@ -46,6 +47,7 @@ const (
 	AlwaysOnEnabledMethodType
 	UpdateVersionMethodType
 	AutoDownloadUpdatesTurnedOnMethodType
+	ReadLogMethodType // appended last: the numbers above are part of the wire format
 )
 
 var (
@@ -442,6 +444,10 @@ func IPCClientGetUserSecrets(userID string) (secretstore.UserSecrets, error) {
 		return secretstore.UserSecrets{}, err
 	}
 	err = rpcDecodeError()
+	if err == nil {
+		// Whatever format a later log line prints these in, they are masked.
+		logging.RegisterSecrets(secrets.SessionToken, secrets.OlmSecret)
+	}
 	return secrets, err
 }
 
@@ -558,4 +564,35 @@ func IPCClientAlwaysOn() bool {
 		return false
 	}
 	return enabled
+}
+
+// IPCClientReadLog reads up to max bytes of the daemon log from offset on. It
+// returns errIPCNotConnected when the UI isn't attached to the daemon.
+func IPCClientReadLog(offset int64, max int) (LogChunk, error) {
+	rpcMutex.Lock()
+	defer rpcMutex.Unlock()
+	if rpcEncoder == nil {
+		return LogChunk{}, errIPCNotConnected
+	}
+
+	if err := rpcEncoder.Encode(ReadLogMethodType); err != nil {
+		return LogChunk{}, err
+	}
+	if err := rpcEncoder.Encode(offset); err != nil {
+		return LogChunk{}, err
+	}
+	if err := rpcEncoder.Encode(max); err != nil {
+		return LogChunk{}, err
+	}
+	var chunk LogChunk
+	if err := rpcDecoder.Decode(&chunk); err != nil {
+		return LogChunk{}, err
+	}
+	err := rpcDecodeError()
+	return chunk, err
+}
+
+// IsIPCNotConnected reports whether err means the UI has no connection to the daemon.
+func IsIPCNotConnected(err error) bool {
+	return errors.Is(err, errIPCNotConnected)
 }

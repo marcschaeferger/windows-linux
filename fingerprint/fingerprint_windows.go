@@ -234,7 +234,8 @@ func runSystemQueryOnce(timeout time.Duration) (windowsSystemQueryResult, error)
 	}
 
 	rawOutput := strings.TrimSpace(string(out))
-	logger.Debug("Fingerprint: system query raw output: %q", rawOutput)
+	// The raw output holds the hardware serial number; log only its size.
+	logger.Debug("Fingerprint: system query returned %d bytes", len(rawOutput))
 
 	var result windowsSystemQueryResult
 	if err := json.Unmarshal([]byte(rawOutput), &result); err != nil {

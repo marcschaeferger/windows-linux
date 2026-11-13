@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,12 +9,15 @@ import (
 	"time"
 
 	"github.com/fosrl/newt/logger"
-	"github.com/fosrl/windows-linux/config"
+	"github.com/fosrl/windows-linux/logging"
+	"github.com/fosrl/windows-linux/managers"
 )
 
 const (
 	maxLogLinesDisplayed = 10000
 	maxInitialLogLines   = 1000
+	// initialLogTailBytes is how much of the end of the log the first load reads.
+	initialLogTailBytes = 1 << 20
 )
 
 // LogEntry is a log line as sent to the Logs tab. Seq increases with every
@@ -38,18 +40,36 @@ type logEntryItem struct {
 }
 
 var (
-	logsMu      sync.Mutex
-	logsQuit    chan struct{}
-	logsItems   []logEntryItem
-	logsSeq     uint64
-	logsFilePos int64
-	logsSize    int64
+	logsMu    sync.Mutex
+	logsQuit  chan struct{}
+	logsItems []logEntryItem
+	logsSeq   uint64
 )
 
-// logFilePath is the log the Logs tab shows: the one the manager service and
-// tunnels write, where connection problems show up.
-func logFilePath() string {
-	return filepath.Join(config.DaemonLogDir(), "pangolin.log")
+// readDaemonLog reads the log the Logs tab shows: the one the manager service
+// and tunnels write, where connection problems show up. That log is not
+// readable by users (on Linux only root can read it), so the daemon reads it
+// for us. Without a connection to the daemon the file is read directly, which
+// works where the log is readable.
+func readDaemonLog(offset int64, max int) (logging.Chunk, error) {
+	chunk, err := managers.IPCClientReadLog(offset, max)
+	if managers.IsIPCNotConnected(err) {
+		chunk, err = managers.ReadLogFile(offset, max)
+	}
+	return chunk, err
+}
+
+// parseLogLines parses and redacts raw log lines. Redaction here covers logs
+// written before secrets were redacted at the source, and lines from other
+// writers, before anything reaches the screen, the clipboard or an export.
+func parseLogLines(raw []string) []LogLine {
+	parsed := make([]LogLine, 0, len(raw))
+	for _, line := range raw {
+		if p := parseLogLine(line); p != nil {
+			parsed = append(parsed, *p)
+		}
+	}
+	return parsed
 }
 
 func toLogEntry(it logEntryItem) LogEntry {
@@ -96,14 +116,33 @@ func startLogTail() {
 	logsQuit = make(chan struct{})
 	quit := logsQuit
 	logsItems = nil
-	logsFilePos, logsSize = 0, 0
-	loadInitialLogsLocked()
-	snapshot := logsSnapshotLocked()
 	logsMu.Unlock()
 
-	app.Event.Emit(eventLogsReset, snapshot)
-
+	// The log comes through the daemon, which can be busy with another call,
+	// so nothing here may block the window that is opening: the first load
+	// happens in the background and replaces the (empty) list when it is in.
 	go func() {
+		tailer := logging.NewTailer(initialLogTailBytes)
+		raw, err := tailer.Start(readDaemonLog)
+		if err != nil {
+			logger.Debug("Logs: failed to read the log: %v", err)
+		}
+		if len(raw) > maxInitialLogLines {
+			raw = raw[len(raw)-maxInitialLogLines:]
+		}
+
+		logsMu.Lock()
+		if logsQuit != quit {
+			// Stopped, and maybe started again, while the log was read.
+			logsMu.Unlock()
+			return
+		}
+		logsItems = nil
+		appendLogLinesLocked(parseLogLines(raw))
+		snapshot := logsSnapshotLocked()
+		logsMu.Unlock()
+		app.Event.Emit(eventLogsReset, snapshot)
+
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -111,7 +150,7 @@ func startLogTail() {
 			case <-quit:
 				return
 			case <-ticker.C:
-				readNewLogLines(quit)
+				readNewLogLines(quit, tailer)
 			}
 		}
 	}()
@@ -126,86 +165,27 @@ func stopLogTail() {
 	}
 }
 
-func loadInitialLogsLocked() {
-	file, err := os.Open(logFilePath())
+func readNewLogLines(quit chan struct{}, tailer *logging.Tailer) {
+	raw, rotated, err := tailer.Poll(readDaemonLog)
 	if err != nil {
-		// The file may not exist yet.
+		// Keep what is shown; the daemon may be restarting. Not logged, as
+		// this runs every second.
 		return
 	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return
-	}
-	logsSize = info.Size()
-
-	lines := make([]string, 0, maxInitialLogLines)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if len(lines) > maxInitialLogLines {
-			lines = lines[1:]
-		}
-	}
-
-	parsed := make([]LogLine, 0, len(lines))
-	for _, line := range lines {
-		if p := parseLogLine(line); p != nil {
-			parsed = append(parsed, *p)
-		}
-	}
-	appendLogLinesLocked(parsed)
-	logsFilePos = logsSize
-}
-
-func readNewLogLines(quit chan struct{}) {
-	file, err := os.Open(logFilePath())
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return
-	}
-	currentSize := info.Size()
+	newLines := parseLogLines(raw)
 
 	logsMu.Lock()
 	defer logsMu.Unlock()
 	if logsQuit != quit {
 		return
 	}
-
-	rotated := false
-	if currentSize < logsSize {
-		// The file was rotated; start over.
-		logsFilePos = 0
+	if rotated {
+		// The log was rotated; what is shown belongs to the old file.
 		logsItems = nil
-		rotated = true
-	}
-	if currentSize <= logsFilePos {
-		logsSize = currentSize
-		if rotated {
-			app.Event.Emit(eventLogsReset, logsSnapshotLocked())
-		}
-		return
-	}
-
-	if _, err := file.Seek(logsFilePos, 0); err != nil {
-		return
-	}
-	var newLines []LogLine
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if p := parseLogLine(scanner.Text()); p != nil {
-			newLines = append(newLines, *p)
+		if len(newLines) > maxInitialLogLines {
+			newLines = newLines[len(newLines)-maxInitialLogLines:]
 		}
 	}
-	logsFilePos = currentSize
-	logsSize = currentSize
-
 	added := appendLogLinesLocked(newLines)
 	if rotated {
 		app.Event.Emit(eventLogsReset, logsSnapshotLocked())
@@ -272,7 +252,7 @@ func exportLogs() {
 		}
 	}
 
-	if err := os.WriteFile(path, []byte(formatLogLines(nil)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(formatLogLines(nil)), 0o600); err != nil {
 		logger.Error("Failed to write log file: %v", err)
 		showError(owner, "Save Failed", fmt.Sprintf("Failed to write file: %v", err))
 		return

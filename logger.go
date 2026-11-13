@@ -1,13 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"time"
 
 	"github.com/fosrl/windows-linux/config"
+	"github.com/fosrl/windows-linux/logging"
 
 	"github.com/fosrl/newt/logger"
 )
@@ -31,97 +31,79 @@ func stringToLogLevel(levelStr string) logger.LogLevel {
 	}
 }
 
-// setupLogging initializes the logger and sets up log file output with rotation
+// isLogOwner reports whether this process is the one that rotates the shared
+// log: the Linux daemon or the Windows manager service. Tunnel processes and
+// UIs append to the same file but never rename it, so the daemon's open file
+// is never rotated out from under it.
+func isLogOwner(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	return args[1] == "--daemon" || args[1] == "/managerservice"
+}
+
+// setupLogging initializes the logger: every line is redacted, then written to
+// the log file, which the owner process rotates by size. If the shared log
+// cannot be opened, for example by a standard user's UI on Windows where
+// ProgramData is read-only, the process logs to a file under its own
+// user data directory instead.
 func setupLogging() {
-	// Initialize the logger and set log level FIRST, before any logging calls
+	// The logger must be ours before anything logs, so the writer comes first.
+	// Until a file is open, lines go to stdout.
+	writer := logging.NewWriter(nil)
+	installed := logging.Install(writer)
+
 	logInstance := logger.GetLogger()
-
-	// Resolve log level from system config file (with built-in default fallback)
 	logLevelStr := config.GetSystemLogLevel()
-	logLevel := stringToLogLevel(logLevelStr)
-	logInstance.SetLevel(logLevel)
-
-	// Create log directory if it doesn't exist
-	logDir := config.GetLogDir()
-	err := os.MkdirAll(logDir, 0755)
-	if err != nil {
-		logger.Error("Failed to create log directory: %v", err)
-		return
+	logInstance.SetLevel(stringToLogLevel(logLevelStr))
+	if !installed {
+		logger.Warn("Logger was initialized before setupLogging; log lines are not redacted")
 	}
 
-	logFile := filepath.Join(logDir, "pangolin.log")
-
-	// Rotate log file if needed
-	err = rotateLogFile(logDir, logFile)
+	owner := isLogOwner(os.Args)
+	file, logFile, err := openLogFile(config.GetLogDir(), owner)
 	if err != nil {
-		logger.Error("Failed to rotate log file: %v", err)
-		// Continue anyway to create new log file
+		logger.Error("Failed to open log file in %s: %v", config.GetLogDir(), err)
+		fallbackDir := filepath.Join(config.UserDataDir(), "logs")
+		var fbErr error
+		file, logFile, fbErr = openLogFile(fallbackDir, owner)
+		if fbErr != nil {
+			logger.Error("Failed to open log file in %s: %v", fallbackDir, fbErr)
+			return
+		}
 	}
 
-	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		logger.Error("Failed to open log file: %v", err)
-		return
+	if installed {
+		writer.SetOutput(file)
+	} else if plain, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		// Redaction is not available; write the way the logger always did.
+		logInstance.SetOutput(plain)
 	}
-
-	// Set the custom logger output
-	logInstance.SetOutput(file)
 
 	logger.Info("Pangolin logging initialized - log file: %s, log level: %s", logFile, logLevelStr)
 }
 
-// rotateLogFile handles daily log rotation
-func rotateLogFile(logDir string, logFile string) error {
-	// Get current log file info
-	info, err := os.Stat(logFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // No current log file to rotate
-		}
-		return fmt.Errorf("failed to stat log file: %v", err)
+// openLogFile creates dir with restrictive permissions and opens pangolin.log in it.
+func openLogFile(dir string, owner bool) (*logging.RotatingFile, string, error) {
+	dirMode, fileMode := logModes()
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		return nil, "", err
 	}
-
-	// Check if log file is from today
-	now := time.Now()
-	fileTime := info.ModTime()
-
-	// If the log file is from today, no rotation needed
-	if now.Year() == fileTime.Year() && now.YearDay() == fileTime.YearDay() {
-		return nil
+	if owner {
+		logging.RestrictDir(dir, dirMode)
 	}
-
-	// Create rotated filename with date
-	rotatedName := fmt.Sprintf("pangolin-%s.log", fileTime.Format("2006-01-02"))
-	rotatedPath := filepath.Join(logDir, rotatedName)
-
-	// Rename current log file to dated filename
-	err = os.Rename(logFile, rotatedPath)
-	if err != nil {
-		return fmt.Errorf("failed to rotate log file: %v", err)
-	}
-
-	cleanupOldLogFiles(logDir, 3)
-	return nil
+	path := filepath.Join(dir, "pangolin.log")
+	file, err := logging.OpenRotatingFile(path, logging.FileOptions{Owner: owner, FileMode: fileMode})
+	return file, path, err
 }
 
-// cleanupOldLogFiles removes log files older than specified days
-func cleanupOldLogFiles(logDir string, daysToKeep int) {
-	cutoff := time.Now().AddDate(0, 0, -daysToKeep)
-	files, err := os.ReadDir(logDir)
-	if err != nil {
-		return
+// logModes returns the directory and file modes for log files. The root
+// daemon's log lists every user's accounts, orgs and tunnel activity, so only
+// root can read it; the Logs tab reads it through the daemon. A user's own
+// logs are private to that user. Windows ignores the modes and relies on ACLs.
+func logModes() (dir, file os.FileMode) {
+	if runtime.GOOS != "windows" && os.Geteuid() == 0 {
+		return 0o750, 0o640
 	}
-
-	for _, file := range files {
-		if !file.IsDir() && strings.HasPrefix(file.Name(), "pangolin-") && strings.HasSuffix(file.Name(), ".log") {
-			filePath := filepath.Join(logDir, file.Name())
-			info, err := file.Info()
-			if err != nil {
-				continue
-			}
-			if info.ModTime().Before(cutoff) {
-				os.Remove(filePath)
-			}
-		}
-	}
+	return 0o700, 0o600
 }

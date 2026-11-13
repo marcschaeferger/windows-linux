@@ -29,8 +29,9 @@ func GetLogDir() string {
 	return filepath.Join(GetProgramDataDir(), "logs")
 }
 
-// DaemonLogDir is where the manager service and tunnels log. On Windows the
-// UI logs there too.
+// DaemonLogDir is where the manager service and tunnels log. Only SYSTEM and
+// Administrators can write there; the UI logs to its own directory (see
+// setupLogging) and reads this log through the manager service.
 func DaemonLogDir() string {
 	return GetLogDir()
 }
