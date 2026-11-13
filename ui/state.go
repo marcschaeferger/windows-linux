@@ -308,34 +308,22 @@ func handleMenuOpen() {
 			return
 		}
 
-		user, err := apiClient.GetUser()
-		if err != nil {
-			var apiErr *api.APIError
-			if errors.As(err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
-				if apiErr.Status == 403 {
-					authManager.MarkSessionExpired()
-				}
-			} else {
+		// Stores the user only if the account didn't change meanwhile.
+		if _, err := authManager.RefreshCurrentUser(); err != nil {
+			switch {
+			case errors.Is(err, auth.ErrSessionChanged):
+				// The account changed while this ran; its own refresh covers it.
+			case api.IsSessionRejected(err):
+				// RefreshCurrentUser marks a 403 as expired; the API client
+				// reports a 401 itself.
+			case api.IsTransient(err):
+				// A timeout, rate limit or server error is not a logout.
+				logger.Warn("Could not refresh the user: %v", err)
+			default:
 				setLoggedOut(true)
 			}
 			publish()
 			return
-		}
-
-		authManager.UpdateCurrentUser(user)
-
-		if accountManager != nil {
-			activeAccount, _ := accountManager.ActiveAccount()
-			if activeAccount != nil && activeAccount.UserID == user.UserId {
-				var username, name string
-				if user.Username != nil {
-					username = *user.Username
-				}
-				if user.Name != nil {
-					name = *user.Name
-				}
-				_ = accountManager.UpdateAccountUserInfo(activeAccount.UserID, username, name)
-			}
 		}
 
 		setLoggedOut(false)

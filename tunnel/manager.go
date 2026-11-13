@@ -226,7 +226,10 @@ func (tm *Manager) buildConfig() (Config, error) {
 		return Config{}, fmt.Errorf("no organization selected")
 	}
 
-	userId := tm.authManager.CurrentUser().UserId
+	// The active account owns the session token above. CurrentUser() can be
+	// nil while authenticated (server down at start, or /user failing after
+	// an account switch), so don't dereference it here.
+	userId := activeAccount.UserID
 	olmId, found := tm.secretManager.GetOlmId(userId)
 	if !found || olmId == "" {
 		return Config{}, fmt.Errorf("OLM ID not found")

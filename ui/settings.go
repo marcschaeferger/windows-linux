@@ -89,13 +89,22 @@ func fetchServerSettings(orgID string) *config.ClientSettings {
 	if apiClient == nil || accountManager == nil {
 		return nil
 	}
+	// Note the account first: the answer is stored under it, and dropped if
+	// the account changed while the request ran.
+	var gen uint64
+	if authManager != nil {
+		gen = authManager.SessionGeneration()
+	}
+	active, activeErr := accountManager.ActiveAccount()
 	settings, err := apiClient.GetMyClientSettings(orgID)
 	if err != nil {
 		logger.Warn("Could not fetch client settings from the server: %v", err)
 		return cachedServerSettings(orgID)
 	}
-	active, err := accountManager.ActiveAccount()
-	if err != nil {
+	if authManager != nil && authManager.SessionGeneration() != gen {
+		return cachedServerSettings(orgID)
+	}
+	if activeErr != nil {
 		return settings
 	}
 	if err := accountManager.SetServerSettings(active.UserID, orgID, settings); err != nil {

@@ -67,6 +67,17 @@ type AuthManager struct {
 	sessionExpired             bool
 	isDeviceAuthInProgress     bool
 	startDeviceAuthImmediately bool
+
+	// sessionGen changes whenever the active session changes (login,
+	// account switch, logout). Requests that run without the lock note it
+	// first and drop their result if it changed, so a slow refresh for one
+	// account can't overwrite the state of the next.
+	sessionGen uint64
+
+	// deviceAuthOwner is the device-login attempt allowed to set the device
+	// code (0 when none); deviceAuthSeq numbers the attempts.
+	deviceAuthOwner uint64
+	deviceAuthSeq   uint64
 }
 
 // NewAuthManager creates a new AuthManager instance
@@ -97,14 +108,26 @@ func (am *AuthManager) Initialize() error {
 		am.mu.Unlock()
 	}()
 
+	// Initialize also runs again while the UI is up (waitForServer). A login,
+	// account switch or logout that happens meanwhile owns the session; this
+	// run must not reset the client to the account it read before that.
+	startGen := am.sessionGeneration()
 	activeAccount, _ := am.accountManager.ActiveAccount()
 	if activeAccount != nil {
 		logger.Debug("Auth: active account found (userId=%s), loading session token", activeAccount.UserID)
 		// Load session token from secrets store via manager IPC
 		token, found := am.secretManager.GetSessionToken(activeAccount.UserID)
 		if found && token != "" {
-			am.apiClient.UpdateBaseURL(activeAccount.Hostname)
-			am.apiClient.UpdateSessionToken(token)
+			am.mu.Lock()
+			if am.sessionGen != startGen {
+				am.mu.Unlock()
+				logger.Debug("Auth: session changed while initializing; leaving it alone")
+				return nil
+			}
+			am.sessionGen++
+			gen := am.sessionGen
+			am.apiClient.SetSession(activeAccount.Hostname, token)
+			am.mu.Unlock()
 
 			// Health check before fetching user/orgs
 			_ = am.CheckHealthAndSetState()
@@ -116,7 +139,9 @@ func (am *AuthManager) Initialize() error {
 			if serverDown {
 				// Server is down, but keep authenticated state to show UI
 				am.mu.Lock()
-				am.isAuthenticated = true
+				if am.sessionGen == gen {
+					am.isAuthenticated = true
+				}
 				am.mu.Unlock()
 				return nil
 			}
@@ -124,20 +149,38 @@ func (am *AuthManager) Initialize() error {
 			// Always fetch the latest user info to verify the user exists and update stored info
 			user, err := am.apiClient.GetUser()
 			if err != nil {
-				var apiErr *api.APIError
-				if errors.As(err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
+				switch {
+				case api.IsSessionRejected(err):
 					// Session expired; keep user in logged-in UI and show re-auth
-					am.MarkSessionExpired()
 					am.mu.Lock()
-					am.isAuthenticated = true
+					if am.sessionGen == gen {
+						am.isAuthenticated = true
+						am.markSessionExpiredLocked()
+					}
 					am.mu.Unlock()
-					return nil
+				case api.IsTransient(err):
+					// A timeout, rate limit or server error says nothing about the
+					// stored session. Keep it and treat the server as down, so the
+					// startup wait and the next tray open check again.
+					logger.Warn("Auth: could not load the user, keeping the stored session: %v", err)
+					am.mu.Lock()
+					if am.sessionGen == gen {
+						am.isAuthenticated = true
+						am.isServerDown = true
+						msg := fmt.Sprintf("Could not load your account from the server: %v", err)
+						am.errorMessage = &msg
+						am.restoreCachedOrganizationLocked(activeAccount)
+					}
+					am.mu.Unlock()
+				default:
+					// The server answered that the user is gone (e.g. 404).
+					am.mu.Lock()
+					if am.sessionGen == gen {
+						am.isAuthenticated = false
+					}
+					am.mu.Unlock()
 				}
-				// Token is invalid or user doesn't exist, clear it
-				am.mu.Lock()
-				am.isAuthenticated = false
-				am.mu.Unlock()
-				return nil // Not an error, just not authenticated
+				return nil // Not an error, just not (yet) verified
 			}
 
 			// Update account info with user data
@@ -152,7 +195,10 @@ func (am *AuthManager) Initialize() error {
 			_ = am.accountManager.UpdateAccountUserInfo(activeAccount.UserID, username, name)
 
 			// Update stored config with latest user info
-			err = am.handleSuccessfulAuth(user, activeAccount.Hostname, token)
+			err = am.activateSession(gen, nil, am.apiClient, user, token, false)
+			if errors.Is(err, ErrSessionChanged) {
+				return nil
+			}
 			return err
 		}
 		logger.Debug("Auth: no session token for active account")
@@ -161,60 +207,99 @@ func (am *AuthManager) Initialize() error {
 	}
 
 	am.mu.Lock()
-	am.isAuthenticated = false
+	if am.sessionGen == startGen {
+		am.isAuthenticated = false
+	}
 	am.mu.Unlock()
 	return nil
 }
 
-// LoginWithDeviceAuth authenticates using device authentication flow
-// The context can be used to cancel the polling operation
-func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride *string) error {
-	am.mu.Lock()
-	am.isDeviceAuthInProgress = true
-	am.mu.Unlock()
-	defer func() {
-		am.mu.Lock()
-		am.isDeviceAuthInProgress = false
-		am.mu.Unlock()
-	}()
+// ErrSessionChanged reports that the active session changed (login, account
+// switch or logout) while a request ran, so its result was dropped.
+var ErrSessionChanged = errors.New("the active account changed")
 
-	// Use temporary API client if hostname override is provided
-	var loginClient *api.APIClient
-	if hostnameOverride != nil && *hostnameOverride != "" {
-		// Create temporary client with override hostname
-		loginClient = api.NewAPIClient(*hostnameOverride, "")
-		loginClient.SetSessionCookieName(am.configManager.GetSessionCookieName())
-	} else {
-		// Use main API client
-		loginClient = am.apiClient
+// beginDeviceAuth makes a new device-login attempt the one whose code the UI
+// shows, replacing any earlier attempt, and returns its ID. An attempt whose
+// ctx is already cancelled gets none: the UI cancels an attempt before it
+// starts the next, so a superseded attempt that is scheduled late can't take
+// ownership from its replacement.
+func (am *AuthManager) beginDeviceAuth(ctx context.Context) (uint64, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
+	am.deviceAuthSeq++
+	am.deviceAuthOwner = am.deviceAuthSeq
+	am.deviceAuthCode = nil
+	am.deviceAuthLoginURL = nil
+	am.isDeviceAuthInProgress = true
+	return am.deviceAuthSeq, nil
+}
+
+// setDeviceAuth sets the device code and login URL shown to the user, if the
+// attempt is still the current one. A superseded attempt must not replace or
+// clear the newer attempt's code.
+func (am *AuthManager) setDeviceAuth(attempt uint64, code, loginURL *string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if am.deviceAuthOwner != attempt {
+		return
+	}
+	am.deviceAuthCode = code
+	am.deviceAuthLoginURL = loginURL
+}
+
+// endDeviceAuth clears the in-progress flag, if the attempt is still the current one.
+func (am *AuthManager) endDeviceAuth(attempt uint64) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if am.deviceAuthOwner != attempt {
+		return
+	}
+	am.deviceAuthOwner = 0
+	am.isDeviceAuthInProgress = false
+}
+
+// LoginWithDeviceAuth authenticates using device authentication flow.
+// Cancelling ctx aborts the attempt, including a request in flight.
+//
+// Everything runs on a separate client until the new session is verified and
+// stored; only then does it replace the active account's client and state, so
+// a failed login leaves the active account as it was.
+func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride *string) error {
+	attempt, err := am.beginDeviceAuth(ctx)
+	if err != nil {
+		return err
+	}
+	defer am.endDeviceAuth(attempt)
+
+	baseURL := am.apiClient.CurrentBaseURL()
+	if hostnameOverride != nil && *hostnameOverride != "" {
+		baseURL = *hostnameOverride
+	}
+	loginClient := api.NewAPIClient(baseURL, "")
+	loginClient.SetSessionCookieName(am.configManager.GetSessionCookieName())
 
 	// Get friendly device name (e.g., "Windows Laptop" or "Windows Desktop")
 	deviceName := config.GetFriendlyDeviceName()
 
 	// Start device auth
-	startResponse, err := loginClient.StartDeviceAuth("Pangolin "+version.OSDisplayName+" Client", &deviceName)
+	startResponse, err := loginClient.StartDeviceAuthContext(ctx, "Pangolin "+version.OSDisplayName+" Client", &deviceName)
 	if err != nil {
-		am.mu.Lock()
-		if apiErr, ok := err.(*api.APIError); ok {
-			msg := apiErr.Error()
-			am.errorMessage = &msg
-		} else {
-			msg := err.Error()
-			am.errorMessage = &msg
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-		am.mu.Unlock()
 		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 
 	// Store code and URL for UI display
 	code := startResponse.Code
 	loginURL := fmt.Sprintf("%s/auth/login/device", loginClient.CurrentBaseURL())
-
-	am.mu.Lock()
-	am.deviceAuthCode = &code
-	am.deviceAuthLoginURL = &loginURL
-	am.mu.Unlock()
+	am.setDeviceAuth(attempt, &code, &loginURL)
 
 	// Poll for verification
 	expiresAt := time.Now().Add(time.Duration(startResponse.ExpiresInSeconds) * time.Second)
@@ -229,13 +314,10 @@ func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride
 		select {
 		case <-ctx.Done():
 			// Context canceled, clear state and return
-			am.mu.Lock()
-			am.deviceAuthCode = nil
-			am.deviceAuthLoginURL = nil
-			am.mu.Unlock()
+			am.setDeviceAuth(attempt, nil, nil)
 			return ctx.Err()
 		case <-ticker.C:
-			pollResponse, token, err := loginClient.PollDeviceAuth(code)
+			pollResponse, token, err := loginClient.PollDeviceAuthContext(ctx, code)
 			if err != nil {
 				// Continue polling on error
 				continue
@@ -249,10 +331,7 @@ func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride
 			} else if pollResponse.Message != nil {
 				message := *pollResponse.Message
 				if contains(message, "expired") || contains(message, "not found") {
-					am.mu.Lock()
-					am.deviceAuthCode = nil
-					am.deviceAuthLoginURL = nil
-					am.mu.Unlock()
+					am.setDeviceAuth(attempt, nil, nil)
 					return &AuthError{Type: AuthErrorDeviceCodeExpired}
 				}
 			}
@@ -260,10 +339,7 @@ func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride
 	}
 
 	if !verified {
-		am.mu.Lock()
-		am.deviceAuthCode = nil
-		am.deviceAuthLoginURL = nil
-		am.mu.Unlock()
+		am.setDeviceAuth(attempt, nil, nil)
 		return &AuthError{Type: AuthErrorDeviceCodeExpired}
 	}
 
@@ -271,119 +347,89 @@ func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride
 		return &AuthError{Type: AuthErrorInvalidToken}
 	}
 
-	// If hostname override was provided, update main API client's base URL
-	if hostnameOverride != nil && *hostnameOverride != "" {
-		am.apiClient.UpdateBaseURL(*hostnameOverride)
+	// Verify the new session on the login client, not the active account's.
+	loginClient.UpdateSessionToken(*sessionToken)
+	user, err := loginClient.GetUserContext(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		am.setDeviceAuth(attempt, nil, nil)
+		return ctxErr
 	}
-
-	// Save token
-	am.apiClient.UpdateSessionToken(*sessionToken)
-
-	// Get user info using main API client (now with updated base URL if override was provided)
-	user, err := am.apiClient.GetUser()
 	if err != nil {
-		am.mu.Lock()
-		msg := err.Error()
-		am.errorMessage = &msg
-		am.mu.Unlock()
 		return err
 	}
 
 	// Clear device auth UI state after successful auth
-	am.mu.Lock()
-	am.deviceAuthCode = nil
-	am.deviceAuthLoginURL = nil
-	am.mu.Unlock()
+	am.setDeviceAuth(attempt, nil, nil)
 
-	return am.handleSuccessfulAuth(user, loginClient.CurrentBaseURL(), *sessionToken)
+	// Commit only while this attempt is still the current one and not
+	// cancelled; both are checked under am.mu together with the commit.
+	stillCurrent := func() bool { return ctx.Err() == nil && am.deviceAuthOwner == attempt }
+	if err := am.activateSession(0, stillCurrent, loginClient, user, *sessionToken, true); err != nil {
+		if errors.Is(err, ErrSessionChanged) && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	return nil
 }
 
-// Select an organization if there isn't one already. This happens
-// only for account login and when switching accounts.
-// Returns the selected organization's ID.
-// This does NOT get persisted to the account store; callers
-// persist it to the account store themselves.
-// If account is provided, it will use that account's stored org ID.
-// Otherwise, it will use the active account's stored org ID.
-func (am *AuthManager) ensureOrgIsSelected(account *config.Account) string {
-	var selectedOrgID string
-
-	am.mu.RLock()
-	userID := am.currentUser.UserId
-	am.mu.RUnlock()
-
-	orgsResponse, err := am.apiClient.ListUserOrgs(userID)
+// loadOrganizations lists userID's organizations on client and picks the one
+// to select: the account's remembered organization if it still exists,
+// otherwise the first one.
+func loadOrganizations(client *api.APIClient, userID string, account *config.Account) ([]api.Org, *api.Org, error) {
+	orgsResponse, err := client.ListUserOrgs(userID)
 	if err != nil {
-		// Non-fatal error, continue without org
-		logger.Error("Failed to load organizations: %v", err)
-		am.mu.Lock()
-		am.organizations = []api.Org{}
-		am.mu.Unlock()
-	} else {
-		am.mu.Lock()
-		am.organizations = orgsResponse.Orgs
-		am.mu.Unlock()
-
-		// Restore last selected org from config,
-		// or auto-select a random one.
-		var accountToUse *config.Account
-		if account != nil {
-			// Use the provided account (e.g., when switching accounts)
-			accountToUse = account
-		} else {
-			// Fall back to active account (e.g., during initial login)
-			if activeAccount, _ := am.accountManager.ActiveAccount(); activeAccount != nil {
-				accountToUse = activeAccount
+		return []api.Org{}, nil, err
+	}
+	orgs := orgsResponse.Orgs
+	if orgs == nil {
+		orgs = []api.Org{}
+	}
+	if account != nil && account.OrgID != "" {
+		for i := range orgs {
+			if orgs[i].Id == account.OrgID {
+				org := orgs[i]
+				return orgs, &org, nil
 			}
-		}
-
-		if accountToUse != nil && accountToUse.OrgID != "" {
-			// Try to restore the last selected org for this account
-			for _, org := range orgsResponse.Orgs {
-				if org.Id == accountToUse.OrgID {
-					am.mu.Lock()
-					am.currentOrg = &org
-					selectedOrgID = am.currentOrg.Id
-					am.mu.Unlock()
-					break
-				}
-			}
-		}
-
-		// If no org was selected (either no stored org ID or stored org no longer exists),
-		// auto-select the first available org
-		if selectedOrgID == "" && len(orgsResponse.Orgs) > 0 {
-			am.mu.Lock()
-			am.currentOrg = &orgsResponse.Orgs[0]
-			selectedOrgID = am.currentOrg.Id
-			am.mu.Unlock()
 		}
 	}
-
-	return selectedOrgID
+	if len(orgs) > 0 {
+		org := orgs[0]
+		return orgs, &org, nil
+	}
+	return orgs, nil, nil
 }
 
-// handleSuccessfulAuth handles successful authentication
-func (am *AuthManager) handleSuccessfulAuth(user *api.User, hostname string, token string) error {
-	am.apiClient.UpdateBaseURL(hostname)
-	am.apiClient.UpdateSessionToken(token)
-
+// activateSession makes a verified session the active one: it loads the
+// user's organizations through client, stores the token (when saveToken is
+// set), and only then switches the shared API client, the in-memory state and
+// the account store over to it in one step.
+//
+// gen is the session generation the caller started from, or 0 for a new
+// login. When the session changed since then (another login, an account
+// switch or a logout), nothing is applied and ErrSessionChanged is returned.
+// stillCurrent, if set, is checked with am.mu held right before the commit;
+// returning false also drops the session with ErrSessionChanged.
+func (am *AuthManager) activateSession(gen uint64, stillCurrent func() bool, client *api.APIClient, user *api.User, token string, saveToken bool) error {
 	// Ensure userId is set (map from Id if needed)
 	if user.UserId == "" {
 		user.UserId = user.Id
 	}
-
-	am.UpdateCurrentUser(user)
+	hostname := client.CurrentBaseURL()
 
 	// Check if account already exists to use its stored org ID
 	var existingAccount *config.Account
-	if existingAcc, exists := am.accountManager.Account(user.UserId); exists {
-		existingAccount = &existingAcc
+	if existing, ok := am.accountManager.Account(user.UserId); ok {
+		existingAccount = &existing
 	}
 
-	selectedOrgID := am.ensureOrgIsSelected(existingAccount)
+	orgs, selectedOrg, orgErr := loadOrganizations(client, user.UserId, existingAccount)
+	if orgErr != nil {
+		// Non-fatal error, continue without the org list
+		logger.Error("Failed to load organizations: %v", orgErr)
+	}
 
-	if !am.secretManager.SaveSessionToken(user.UserId, token) {
+	if saveToken && !am.secretManager.SaveSessionToken(user.UserId, token) {
 		logger.Error("Auth: SaveSessionToken() failed (userId=%s)", user.UserId)
 		return fmt.Errorf("failed to save session token")
 	}
@@ -401,23 +447,53 @@ func (am *AuthManager) handleSuccessfulAuth(user *api.User, hostname string, tok
 	newAccount := config.Account{
 		UserID:   user.UserId,
 		Email:    user.Email,
-		OrgID:    selectedOrgID,
 		Username: username,
 		Name:     name,
-		Hostname: am.apiClient.CurrentBaseURL(),
+		Hostname: hostname,
+	}
+	switch {
+	case selectedOrg != nil:
+		newAccount.OrgID = selectedOrg.Id
+	case orgErr != nil && existingAccount != nil:
+		// Keep the remembered organization when the list could not be loaded.
+		newAccount.OrgID = existingAccount.OrgID
 	}
 
+	am.mu.Lock()
+	if (gen != 0 && am.sessionGen != gen) || (stillCurrent != nil && !stillCurrent()) {
+		am.mu.Unlock()
+		if saveToken && existingAccount == nil {
+			// Don't leave a token behind for an account that was never added,
+			// unless another login added it meanwhile with its own token.
+			if _, added := am.accountManager.Account(user.UserId); !added {
+				if stored, ok := am.secretManager.GetSessionToken(user.UserId); ok && stored == token {
+					_ = am.secretManager.DeleteSessionToken(user.UserId)
+				}
+			}
+		}
+		return ErrSessionChanged
+	}
+	am.sessionGen++
+	gen = am.sessionGen
+	am.apiClient.SetSession(hostname, token)
+	am.currentUser = user
+	am.organizations = orgs
+	am.currentOrg = selectedOrg
+	am.serverInfo = nil
+	am.isServerDown = false
+	am.errorMessage = nil
 	_ = am.accountManager.AddAccount(newAccount)
 	_ = am.accountManager.SetActiveUser(user.UserId)
-
-	am.mu.Lock()
+	if am.currentOrg == nil {
+		am.restoreCachedOrganizationLocked(&newAccount)
+	}
 	am.isAuthenticated = true
 	am.sessionExpired = false
 	am.startDeviceAuthImmediately = false
 	am.mu.Unlock()
 
 	// Fetch server info after successful authentication
-	_ = am.fetchServerInfo()
+	_ = am.fetchServerInfo(gen)
 
 	return nil
 }
@@ -425,9 +501,40 @@ func (am *AuthManager) handleSuccessfulAuth(user *api.User, hostname string, tok
 // MarkSessionExpired sets the session-expired state so the UI shows re-auth and disables connect.
 // Called from the API layer (on 401/403) and tunnel layer (on session-expired error codes).
 // The last selected org stays visible from the locally cached account org id.
+// It does nothing when no session is active, e.g. after logging out.
 func (am *AuthManager) MarkSessionExpired() {
 	am.mu.Lock()
 	defer am.mu.Unlock()
+	am.markSessionExpiredLocked()
+}
+
+// MarkSessionExpiredFor marks the session expired only if the API client
+// still uses token, the session token a rejected request was sent with. The
+// API client's 401 callback runs it asynchronously; by then the user may have
+// switched accounts, and the new account's session is not expired.
+func (am *AuthManager) MarkSessionExpiredFor(token string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if token == "" || am.apiClient.SessionToken() != token {
+		return
+	}
+	am.markSessionExpiredLocked()
+}
+
+// markSessionExpiredIf marks the session expired if it is still generation gen.
+func (am *AuthManager) markSessionExpiredIf(gen uint64) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	if am.sessionGen != gen {
+		return
+	}
+	am.markSessionExpiredLocked()
+}
+
+func (am *AuthManager) markSessionExpiredLocked() {
+	if !am.isAuthenticated {
+		return
+	}
 	am.sessionExpired = true
 	am.errorMessage = nil
 	if account, err := am.accountManager.ActiveAccount(); err == nil {
@@ -460,6 +567,7 @@ func (am *AuthManager) restoreCachedOrganizationLocked(account *config.Account) 
 func (am *AuthManager) RefreshOrganizations() error {
 	am.mu.RLock()
 	authenticated := am.isAuthenticated
+	gen := am.sessionGen
 	userId := ""
 	if am.currentUser != nil {
 		userId = am.currentUser.UserId
@@ -478,6 +586,13 @@ func (am *AuthManager) RefreshOrganizations() error {
 	}
 
 	am.mu.Lock()
+	if am.sessionGen != gen {
+		// The account changed while the request ran; this list belongs to
+		// the previous one.
+		am.mu.Unlock()
+		logger.Debug("Dropping organizations fetched for a previous session")
+		return nil
+	}
 	newOrgs := orgsResponse.Orgs
 	currentOrgId := ""
 	if am.currentOrg != nil {
@@ -498,9 +613,7 @@ func (am *AuthManager) RefreshOrganizations() error {
 		if !found {
 			// Current org no longer exists, clear selection
 			am.currentOrg = nil
-			if activeAccount, _ := am.accountManager.ActiveAccount(); activeAccount != nil {
-				_ = am.accountManager.SetUserOrganization(activeAccount.UserID, "")
-			}
+			_ = am.accountManager.SetUserOrganization(userId, "")
 		}
 	} else if activeAccount, _ := am.accountManager.ActiveAccount(); activeAccount != nil && activeAccount.OrgID != "" {
 		// Restore selection from the cached account org after an offline startup
@@ -518,6 +631,67 @@ func (am *AuthManager) RefreshOrganizations() error {
 
 	logger.Debug("Organizations refreshed successfully: %d orgs", len(newOrgs))
 	return nil
+}
+
+// RefreshCurrentUser fetches the signed-in user from the server and stores
+// it, with the account's display info. When the active session changed while
+// the request ran, the result is dropped and ErrSessionChanged is returned,
+// whatever the request's own outcome.
+func (am *AuthManager) RefreshCurrentUser() (*api.User, error) {
+	gen := am.sessionGeneration()
+	user, err := am.apiClient.GetUser()
+	if am.sessionGeneration() != gen {
+		return nil, ErrSessionChanged
+	}
+	if err != nil {
+		// A 403 means the session is no longer accepted. (A 401 is reported
+		// through the API client's callback.)
+		if api.HTTPStatus(err) == 403 {
+			am.markSessionExpiredIf(gen)
+		}
+		return nil, err
+	}
+	if user.UserId == "" {
+		user.UserId = user.Id
+	}
+
+	active, _ := am.accountManager.ActiveAccount()
+	if active == nil || active.UserID != user.UserId {
+		return nil, ErrSessionChanged
+	}
+
+	am.mu.Lock()
+	if am.sessionGen != gen {
+		am.mu.Unlock()
+		return nil, ErrSessionChanged
+	}
+	am.currentUser = user
+	am.mu.Unlock()
+
+	var username, name string
+	if user.Username != nil {
+		username = *user.Username
+	}
+	if user.Name != nil {
+		name = *user.Name
+	}
+	_ = am.accountManager.UpdateAccountUserInfo(user.UserId, username, name)
+	return user, nil
+}
+
+// SessionGeneration identifies the active session; it changes on every
+// login, account switch and logout. Code that applies the result of a request
+// made without the lock compares it before and after.
+func (am *AuthManager) SessionGeneration() uint64 {
+	return am.sessionGeneration()
+}
+
+// sessionGeneration identifies the active session; it changes on every login,
+// account switch and logout.
+func (am *AuthManager) sessionGeneration() uint64 {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return am.sessionGen
 }
 
 // RefreshFromMyDevice refreshes user info, organizations, and authentication status from MyDevice API
@@ -680,6 +854,7 @@ func (am *AuthManager) CheckOrgAccess(orgId string) (bool, error) {
 func (am *AuthManager) SelectOrganization(org *api.Org) error {
 	am.mu.RLock()
 	user := am.currentUser
+	gen := am.sessionGen
 	am.mu.RUnlock()
 	if user == nil {
 		return errors.New("not signed in")
@@ -691,8 +866,13 @@ func (am *AuthManager) SelectOrganization(org *api.Org) error {
 		return err
 	}
 
-	// If access is granted, proceed with selecting the org
+	// If access is granted, proceed with selecting the org, unless the
+	// account changed while access was checked.
 	am.mu.Lock()
+	if am.sessionGen != gen {
+		am.mu.Unlock()
+		return ErrSessionChanged
+	}
 	am.currentOrg = org
 	am.mu.Unlock()
 
@@ -711,7 +891,13 @@ func (am *AuthManager) EnsureOlmCredentials(userId string) error {
 	if am.secretManager.HasOlmCredentials(userId) {
 		olmIdString, found := am.secretManager.GetOlmId(userId)
 		if found {
+			gen := am.sessionGeneration()
 			olm, err := am.apiClient.GetUserOlm(userId, olmIdString, nil)
+			if am.sessionGeneration() != gen {
+				// The answer came from another account's session; it says
+				// nothing about these credentials.
+				return ErrSessionChanged
+			}
 			switch {
 			case err == nil && olm != nil && olm.OlmId == olmIdString:
 				logger.Info("Auth: OLM credentials verified (userId=%s)", userId)
@@ -787,13 +973,16 @@ func (am *AuthManager) SwitchAccount(userID string) error {
 		return errors.New("session token does not exist for this user")
 	}
 
-	// Step 1: Switch locally first (optimistic switch)
-	_ = am.accountManager.SetActiveUser(userID)
-	am.apiClient.UpdateBaseURL(accountToSwitchTo.Hostname)
-	am.apiClient.UpdateSessionToken(token)
-
+	// Step 1: Switch locally first (optimistic switch). The stored active
+	// account, the server and the token change together, and the new
+	// generation makes requests still running for the previous account drop
+	// their results.
 	// Step 2: Clear user data and per-session state immediately
 	am.mu.Lock()
+	am.sessionGen++
+	gen := am.sessionGen
+	_ = am.accountManager.SetActiveUser(userID)
+	am.apiClient.SetSession(accountToSwitchTo.Hostname, token)
 	am.currentUser = nil
 	am.currentOrg = nil
 	am.organizations = []api.Org{}
@@ -820,19 +1009,26 @@ func (am *AuthManager) SwitchAccount(userID string) error {
 
 	// Fetch user data
 	user, err := am.apiClient.GetUser()
+	if am.sessionGeneration() != gen {
+		return nil
+	}
 	if err != nil {
-		var apiErr *api.APIError
-		if errors.As(err, &apiErr) && (apiErr.Status == 401 || apiErr.Status == 403) {
-			am.MarkSessionExpired()
+		if api.IsSessionRejected(err) {
+			am.markSessionExpiredIf(gen)
 		} else {
 			am.mu.Lock()
-			msg := err.Error()
-			am.errorMessage = &msg
-			am.restoreCachedOrganizationLocked(&accountToSwitchTo)
+			if am.sessionGen == gen {
+				msg := err.Error()
+				am.errorMessage = &msg
+				am.restoreCachedOrganizationLocked(&accountToSwitchTo)
+			}
 			am.mu.Unlock()
 		}
 		logger.Error("Failed to fetch user after account switch: %v", err)
 		return nil
+	}
+	if user.UserId == "" {
+		user.UserId = user.Id
 	}
 
 	// Update account info with user data
@@ -846,39 +1042,77 @@ func (am *AuthManager) SwitchAccount(userID string) error {
 	}
 	_ = am.accountManager.UpdateAccountUserInfo(userID, username, name)
 
-	am.UpdateCurrentUser(user)
-
 	// Select organization
-	selectedOrgID := am.ensureOrgIsSelected(&accountToSwitchTo)
-	_ = am.accountManager.SetUserOrganization(userID, selectedOrgID)
+	orgs, selectedOrg, orgErr := loadOrganizations(am.apiClient, user.UserId, &accountToSwitchTo)
+	if orgErr != nil {
+		logger.Error("Failed to load organizations: %v", orgErr)
+	}
+
+	am.mu.Lock()
+	if am.sessionGen != gen {
+		am.mu.Unlock()
+		return nil
+	}
+	am.currentUser = user
+	am.organizations = orgs
+	am.currentOrg = selectedOrg
+	if selectedOrg != nil {
+		_ = am.accountManager.SetUserOrganization(userID, selectedOrg.Id)
+	} else if orgErr != nil {
+		// Keep the remembered organization when the list could not be loaded.
+		am.restoreCachedOrganizationLocked(&accountToSwitchTo)
+	} else {
+		_ = am.accountManager.SetUserOrganization(userID, "")
+	}
+	am.mu.Unlock()
 
 	// Fetch server info
-	_ = am.fetchServerInfo()
+	_ = am.fetchServerInfo(gen)
 
 	return nil
 }
 
 // Logout logs out the current user
 func (am *AuthManager) Logout() error {
-	// Try to call logout endpoint (ignore errors)
-	_ = am.apiClient.Logout()
-
+	am.mu.RLock()
+	gen := am.sessionGen
+	baseURL, token := am.apiClient.CurrentBaseURL(), am.apiClient.SessionToken()
+	am.mu.RUnlock()
 	userID := am.accountManager.ActiveUserID()
+
+	// Try to call logout endpoint (ignore errors), with the session read
+	// above so a switch meanwhile can't end the next account's session. It
+	// doesn't report a 401 as an expired session either.
+	if token != "" {
+		client := api.NewAPIClient(baseURL, token)
+		client.SetSessionCookieName(am.apiClient.SessionCookieName())
+		_ = client.Logout()
+	}
 
 	// Find the account to switch to afterwards: the first remaining one by
 	// name, as the macOS client does.
 	nextAccountID := am.nextAccountAfter(userID)
 
-	// Clear local data
-	am.apiClient.UpdateSessionToken("")
-
+	// Clear local data, including everything that belongs to this session.
 	am.mu.Lock()
+	if am.sessionGen != gen {
+		// A login or account switch replaced the session meanwhile; don't
+		// tear down that one or remove its account.
+		am.mu.Unlock()
+		return ErrSessionChanged
+	}
+	am.sessionGen++
+	am.apiClient.UpdateSessionToken("")
 	am.isAuthenticated = false
+	am.currentUser = nil
 	am.currentOrg = nil
 	am.organizations = []api.Org{}
+	am.serverInfo = nil
+	am.isServerDown = false
+	am.sessionExpired = false
 	am.errorMessage = nil
-	am.deviceAuthCode = nil
-	am.deviceAuthLoginURL = nil
+	// The device code belongs to a login that may be running for another
+	// account; it is left to that attempt.
 	am.mu.Unlock()
 
 	_ = am.secretManager.DeleteSessionToken(userID)
@@ -891,8 +1125,7 @@ func (am *AuthManager) Logout() error {
 	// Auto-select next available account if one exists
 	if nextAccountID != "" {
 		// Check if the account still exists (it should, since we got it before removal)
-		_, exists := am.accountManager.Account(nextAccountID)
-		if exists {
+		if _, exists := am.accountManager.Account(nextAccountID); exists {
 			// Switch to the next available account
 			if err := am.SwitchAccount(nextAccountID); err != nil {
 				logger.Warn("Failed to auto-switch to next account after logout: %v", err)
@@ -951,39 +1184,33 @@ func (am *AuthManager) DeleteAccount(userID string) error {
 
 // CheckHealthAndSetState performs a health check and updates the server down state
 func (am *AuthManager) CheckHealthAndSetState() error {
+	gen := am.sessionGeneration()
 	healthy, err := am.apiClient.CheckHealth()
-	if err != nil {
-		// Network error means server is down
-		am.mu.Lock()
-		am.isServerDown = true
-		msg := "The server appears to be down."
-		am.errorMessage = &msg
-		if account, accErr := am.accountManager.ActiveAccount(); accErr == nil {
-			am.restoreCachedOrganizationLocked(account)
-		}
-		am.mu.Unlock()
-		return err
-	}
 
 	am.mu.Lock()
-	if !healthy {
+	defer am.mu.Unlock()
+	if am.sessionGen != gen {
+		// The answer is about the previous account's server.
+		return err
+	}
+	if err != nil || !healthy {
+		// Network error means server is down
 		am.isServerDown = true
 		msg := "The server appears to be down."
 		am.errorMessage = &msg
 		if account, accErr := am.accountManager.ActiveAccount(); accErr == nil {
 			am.restoreCachedOrganizationLocked(account)
 		}
-	} else {
-		am.isServerDown = false
-		am.errorMessage = nil
+		return err
 	}
-	am.mu.Unlock()
-
+	am.isServerDown = false
+	am.errorMessage = nil
 	return nil
 }
 
-// fetchServerInfo fetches and stores server information
-func (am *AuthManager) fetchServerInfo() error {
+// fetchServerInfo fetches and stores server information, unless the session
+// changed from gen in the meantime.
+func (am *AuthManager) fetchServerInfo(gen uint64) error {
 	serverInfo, err := am.apiClient.GetServerInfo()
 	if err != nil {
 		// Non-fatal error, just log it
@@ -992,7 +1219,9 @@ func (am *AuthManager) fetchServerInfo() error {
 	}
 
 	am.mu.Lock()
-	am.serverInfo = serverInfo
+	if am.sessionGen == gen {
+		am.serverInfo = serverInfo
+	}
 	am.mu.Unlock()
 
 	return nil
@@ -1090,12 +1319,16 @@ func (am *AuthManager) ClearStartDeviceAuthImmediately() {
 	am.startDeviceAuthImmediately = false
 }
 
-// ClearDeviceAuth clears the device authentication code and URL
+// ClearDeviceAuth clears the device authentication code and URL. A login
+// attempt still running can no longer set them; it has been cancelled or is
+// about to be replaced.
 func (am *AuthManager) ClearDeviceAuth() {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.deviceAuthCode = nil
 	am.deviceAuthLoginURL = nil
+	am.deviceAuthOwner = 0
+	am.isDeviceAuthInProgress = false
 }
 
 // UpdateCurrentUser updates the current user (used for session verification)
