@@ -171,10 +171,26 @@ func (connection *Connection) Get(path string, refresh bool) (response *Response
 	if err != nil {
 		return
 	}
+	// A 404 or 5xx page must not be read as a manifest or an MSI.
+	status, err := response.statusCode()
+	if err != nil {
+		return
+	}
+	if status != 200 {
+		err = fmt.Errorf("unexpected HTTP status %d for %s", status, path)
+		return
+	}
 
 	runtime.SetFinalizer(response, func(response *Response) {
 		response.Close()
 	})
+	return
+}
+
+func (response *Response) statusCode() (code uint32, err error) {
+	defer convertError(&err)
+	size := uint32(unsafe.Sizeof(code))
+	err = winHttpQueryHeaders(response.handle, _WINHTTP_QUERY_STATUS_CODE|_WINHTTP_QUERY_FLAG_NUMBER, nil, unsafe.Pointer(&code), &size, nil)
 	return
 }
 
@@ -201,7 +217,8 @@ func (response *Response) Read(p []byte) (n int, err error) {
 	var bytesRead uint32
 	err = winHttpReadData(response.handle, &p[0], uint32(len(p)), &bytesRead)
 	if err != nil {
-		return 0, nil
+		// Returning (0, nil) here made io.Copy spin forever on a dropped connection.
+		return 0, err
 	}
 	if bytesRead == 0 || int(bytesRead) < 0 {
 		return 0, io.EOF

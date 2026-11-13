@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -90,16 +91,15 @@ func checkForUpdate(keepSession bool) (*UpdateFound, *winhttp.Session, *winhttp.
 	defer response.Close()
 	logger.Debug("Updater: Manifest response received")
 
-	var fileList [1024 * 512] /* 512 KiB */ byte
-	bytesRead, err := response.Read(fileList[:])
-	if err != nil && (err != io.EOF || bytesRead == 0) {
-		logger.Debug("Updater: Failed to read manifest data: %v (bytesRead=%d)", err, bytesRead)
+	manifest, err := io.ReadAll(io.LimitReader(response, maxManifestSize))
+	if err != nil {
+		logger.Debug("Updater: Failed to read manifest data: %v (bytesRead=%d)", err, len(manifest))
 		return nil, nil, nil, err
 	}
-	logger.Debug("Updater: Read %d bytes from manifest", bytesRead)
+	logger.Debug("Updater: Read %d bytes from manifest", len(manifest))
 
 	logger.Debug("Updater: Parsing manifest file list")
-	files, err := readFileList(fileList[:bytesRead])
+	files, err := readFileList(manifest)
 	if err != nil {
 		logger.Debug("Updater: Failed to parse manifest: %v", err)
 		return nil, nil, nil, err
@@ -116,7 +116,7 @@ func checkForUpdate(keepSession bool) (*UpdateFound, *winhttp.Session, *winhttp.
 		logger.Debug("Updater: No update candidate found")
 	} else {
 		logger.Debug("Updater: Update candidate found: %s", updateFound.name)
-		updateFound.manifest = append([]byte(nil), fileList[:bytesRead]...)
+		updateFound.manifest = manifest
 	}
 
 	if keepSession {
@@ -127,6 +127,9 @@ func checkForUpdate(keepSession bool) (*UpdateFound, *winhttp.Session, *winhttp.
 }
 
 var updateInProgress = uint32(0)
+
+// maxManifestSize is the largest signed manifest read from the update server.
+const maxManifestSize = 512 * 1024
 
 // downloadAndVerify checks for an update, downloads its MSI, verifies it against the
 // signed manifest and stages it on disk. progress may be nil when nobody is watching.
@@ -269,7 +272,6 @@ func downloadAndVerify(progress chan DownloadProgress) (*StagedUpdate, error) {
 		}
 	}
 	defer response.Close()
-	defer response.Close()
 	logger.Debug("Updater: MSI download response received")
 
 	length, err := response.Length()
@@ -304,22 +306,22 @@ func downloadAndVerify(progress chan DownloadProgress) (*StagedUpdate, error) {
 	}
 	logger.Debug("Updater: Hash verification passed")
 
-	// // Skip authenticode verification in development mode
-	// devMode := os.Getenv("PANGOLIN_ALLOW_DEV_UPDATES") == "1"
-	// if !devMode {
-	// 	logger.Info("Updater: Verifying Authenticode signature")
-	// 	send(DownloadProgress{Activity: "Verifying authenticode signature"})
-	// 	if !verifyAuthenticode(file.Name()) {
-	// 		logger.Error("Updater: Authenticode verification failed")
-	// 		return nil, errors.New("The downloaded update does not have an authentic authenticode signature")
-	// 	}
-	// 	logger.Info("Updater: Authenticode verification passed")
-	// } else {
-	// 	logger.Info("Updater: Skipping Authenticode verification (dev mode)")
-	// }
-
 	if err := file.Close(); err != nil {
 		return nil, err
+	}
+
+	// Second, independent check next to the signify-signed hash: the release
+	// workflow Authenticode-signs every MSI. PANGOLIN_ALLOW_DEV_UPDATES=1 in the
+	// service's environment skips it for unsigned test builds.
+	if os.Getenv("PANGOLIN_ALLOW_DEV_UPDATES") != "1" {
+		send(DownloadProgress{Activity: "Verifying authenticode signature"})
+		if !verifyAuthenticode(file.Name()) {
+			logger.Error("Updater: Authenticode verification failed")
+			return nil, errors.New("The downloaded update does not have an authentic authenticode signature")
+		}
+		logger.Info("Updater: Authenticode verification passed")
+	} else {
+		logger.Info("Updater: Skipping Authenticode verification (PANGOLIN_ALLOW_DEV_UPDATES=1)")
 	}
 	if err := commitStagedFiles(update.manifest); err != nil {
 		logger.Debug("Updater: Failed to stage update: %v", err)
@@ -404,8 +406,11 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) (progress chan 
 		return
 	}
 
+	// release clears the in-progress flag exactly once, whether doIt ran or
+	// the elevation failed before it could.
+	release := sync.OnceFunc(func() { atomic.StoreUint32(&updateInProgress, 0) })
 	doIt := func() {
-		defer atomic.StoreUint32(&updateInProgress, 0)
+		defer release()
 		logger.Info("Updater: DownloadVerifyAndExecute started (userToken=%v, useStaged=%v)", userToken != 0, useStaged)
 
 		if !useStaged {
@@ -437,7 +442,7 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) (progress chan 
 			processToken.Close()
 			if !isElevated {
 				logger.Info("Updater: Process is not running with admin privileges")
-				atomic.StoreUint32(&updateInProgress, 0)
+				release()
 				progress <- DownloadProgress{Error: errors.New("update requires administrator privileges. Please run the application as administrator")}
 				return progress
 			}
@@ -452,6 +457,7 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) (progress chan 
 			})
 			if err != nil {
 				logger.Info("Updater: Failed to elevate to SYSTEM: %v", err)
+				release()
 				progress <- DownloadProgress{Error: fmt.Errorf("failed to elevate privileges: %w. Make sure the application is running as administrator", err)}
 			}
 		}()
