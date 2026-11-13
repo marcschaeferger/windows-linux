@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -68,9 +69,24 @@ type SystemConfig struct {
 
 // ConfigManager manages loading and saving of application configuration
 type ConfigManager struct {
-	config     *Config
+	// config is the effective view: the machine-wide config overlaid with
+	// user. Readers use it; it is never written to disk as a whole.
+	config *Config
+	// user is the user-owned layer, exactly what is stored in configPath.
+	user       *Config
 	configPath string
+	// loadSystem reads the machine-wide config; LoadSystemConfig unless a test
+	// replaces it.
+	loadSystem func() *SystemConfig
 	mu         sync.RWMutex
+}
+
+// systemConfig returns the machine-wide settings as a Config.
+func (cm *ConfigManager) systemConfig() *Config {
+	if cm.loadSystem != nil {
+		return configFromSystemConfig(cm.loadSystem())
+	}
+	return configFromSystemConfig(LoadSystemConfig())
 }
 
 // NewConfigManager creates a new ConfigManager instance
@@ -109,14 +125,16 @@ func (cm *ConfigManager) GetConfigCopy() *Config {
 // Returns a default config if the file doesn't exist or can't be read
 func (cm *ConfigManager) load() *Config {
 	// Load machine-wide defaults first, then overlay user-specific values.
-	merged := configFromSystemConfig(LoadSystemConfig())
+	system := cm.systemConfig()
 
 	userCfg, ok := cm.loadUserConfig()
 	if !ok {
-		return merged
+		cm.user = &Config{}
+		return mergeWithSystem(system, nil)
 	}
 
-	return mergeConfig(merged, userCfg)
+	cm.user = copyConfig(userCfg)
+	return mergeWithSystem(system, userCfg)
 }
 
 // Load loads the configuration from the file
@@ -128,11 +146,23 @@ func (cm *ConfigManager) Load() *Config {
 	return cm.config
 }
 
-// save saves the configuration to the file without locking
-// Caller must hold the lock
+// save stores the user-owned part of cfg and makes the result the effective
+// config. cfg is the merged view with the caller's changes applied (see
+// getConfigCopy); only what differs from the current view is attributed to the
+// user, so system values (/etc, ProgramData) are never frozen into the user
+// file and later admin changes keep applying.
+// Caller must hold the lock.
 func (cm *ConfigManager) save(cfg *Config) bool {
+	system := cm.systemConfig()
+	user := deriveUserLayer(cm.user, cm.config, cfg, system)
+	return cm.writeUser(user, system)
+}
+
+// writeUser writes the user layer to the user file and rebuilds the effective
+// config from it. Caller must hold the lock.
+func (cm *ConfigManager) writeUser(user, system *Config) bool {
 	// Marshal with pretty printing (equivalent to Swift's .prettyPrinted and .sortedKeys)
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := json.MarshalIndent(user, "", "  ")
 	if err != nil {
 		logger.Error("Error encoding config: %v", err)
 		return false
@@ -144,8 +174,8 @@ func (cm *ConfigManager) save(cfg *Config) bool {
 		return false
 	}
 
-	// Update stored config
-	cm.config = cfg
+	cm.user = user
+	cm.config = mergeWithSystem(system, user)
 	return true
 }
 
@@ -163,9 +193,7 @@ func (cm *ConfigManager) Clear() bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	clearedConfig := &Config{}
-
-	return cm.save(clearedConfig)
+	return cm.writeUser(&Config{}, cm.systemConfig())
 }
 
 // GetDNSOverride returns the DNS override setting from config or the default value
@@ -566,14 +594,14 @@ func userDataDirIn(localAppData string) string {
 // loadMergedConfig loads the machine config overlaid with the per-user config
 // in userDataDir (see UserDataDir), if given.
 func loadMergedConfig(userDataDir string) *Config {
-	merged := configFromSystemConfig(LoadSystemConfig())
+	system := configFromSystemConfig(LoadSystemConfig())
 	if userDataDir != "" {
 		userCfg, ok := loadConfigFile(filepath.Join(userDataDir, ConfigFileName))
 		if ok {
-			merged = mergeConfig(merged, userCfg)
+			return mergeWithSystem(system, userCfg)
 		}
 	}
-	return merged
+	return mergeWithSystem(system, nil)
 }
 
 func autoConnectAtLogin(cfg *Config) bool {
@@ -649,14 +677,15 @@ func AutoDownloadUpdatesEnabled(localAppData string) bool {
 // per-user config file the caller has already read, or nil for none. The Linux
 // daemon reads users' files itself, since it runs as root.
 func AutoDownloadUpdatesEnabledWithUserConfig(userConfig []byte) bool {
-	merged := configFromSystemConfig(LoadSystemConfig())
+	system := configFromSystemConfig(LoadSystemConfig())
+	var user *Config
 	if len(userConfig) > 0 {
 		var cfg Config
 		if err := json.Unmarshal(userConfig, &cfg); err == nil {
-			merged = mergeConfig(merged, &cfg)
+			user = &cfg
 		}
 	}
-	return autoDownloadUpdates(merged)
+	return autoDownloadUpdates(mergeWithSystem(system, user))
 }
 
 func autoDownloadUpdates(cfg *Config) bool {
@@ -718,6 +747,114 @@ func configFromSystemConfig(sys *SystemConfig) *Config {
 		return &Config{}
 	}
 	return copyConfig(&sys.Config)
+}
+
+// mergeWithSystem builds the effective config from the machine-wide config and
+// the user-owned file. The user file overrides the system defaults, except for
+// admin policy: a userSettingsDisabled set in the system config always wins,
+// and while it is true every other value the system config sets wins too, so
+// the lock cannot be undone by editing the user file.
+func mergeWithSystem(system, user *Config) *Config {
+	merged := mergeConfig(system, user)
+	if system == nil {
+		return merged
+	}
+	if system.UserSettingsDisabled != nil {
+		v := *system.UserSettingsDisabled
+		merged.UserSettingsDisabled = &v
+		if v {
+			merged = mergeConfig(merged, system)
+		}
+	}
+	return merged
+}
+
+// deriveUserLayer returns the user-owned config after the caller replaced the
+// effective config old with next. Values the caller changed are attributed to
+// the user; values that merely echo the system config are not stored, and
+// stale copies of the current system values left behind by earlier versions
+// (which saved the whole merged view) are dropped.
+func deriveUserLayer(user, old, next, system *Config) *Config {
+	out := copyConfig(user)
+	old, next, system = copyConfig(old), copyConfig(next), copyConfig(system)
+
+	applyFieldDiff(reflect.ValueOf(out).Elem(), reflect.ValueOf(old).Elem(),
+		reflect.ValueOf(next).Elem(), "Orgs")
+	dropFieldsEqual(reflect.ValueOf(out).Elem(), reflect.ValueOf(system).Elem(), "Orgs")
+
+	orgs := map[string]OrgConfig{}
+	for id, o := range out.Orgs {
+		orgs[id] = o
+	}
+	for id := range old.Orgs {
+		if _, kept := next.Orgs[id]; !kept {
+			delete(orgs, id)
+		}
+	}
+	for id, n := range next.Orgs {
+		o := orgs[id]
+		applyFieldDiff(reflect.ValueOf(&o).Elem(), reflect.ValueOf(old.Orgs[id]),
+			reflect.ValueOf(n), "")
+		dropFieldsEqual(reflect.ValueOf(&o).Elem(), reflect.ValueOf(system.Orgs[id]), "")
+		if o.IsEmpty() {
+			delete(orgs, id)
+		} else {
+			orgs[id] = o
+		}
+	}
+	out.Orgs = nil
+	if len(orgs) > 0 {
+		out.Orgs = orgs
+	}
+	return out
+}
+
+// applyFieldDiff copies every field of next that differs from old into dst.
+// All three are the same struct type; skip names a field to leave alone.
+func applyFieldDiff(dst, old, next reflect.Value, skip string) {
+	for i := 0; i < dst.NumField(); i++ {
+		if dst.Type().Field(i).Name == skip {
+			continue
+		}
+		if reflect.DeepEqual(old.Field(i).Interface(), next.Field(i).Interface()) {
+			continue
+		}
+		dst.Field(i).Set(cloneField(next.Field(i)))
+	}
+}
+
+// dropFieldsEqual clears the fields of dst that are set and equal to the same
+// field of ref.
+func dropFieldsEqual(dst, ref reflect.Value, skip string) {
+	for i := 0; i < dst.NumField(); i++ {
+		if dst.Type().Field(i).Name == skip || dst.Field(i).IsZero() {
+			continue
+		}
+		if reflect.DeepEqual(dst.Field(i).Interface(), ref.Field(i).Interface()) {
+			dst.Field(i).SetZero()
+		}
+	}
+}
+
+// cloneField deep-copies a pointer or slice config field.
+func cloneField(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		c := reflect.New(v.Type().Elem())
+		c.Elem().Set(v.Elem())
+		return c
+	case reflect.Slice:
+		if v.Len() == 0 {
+			return reflect.Zero(v.Type())
+		}
+		c := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		reflect.Copy(c, v)
+		return c
+	}
+	return v
 }
 
 // mergeConfig overlays override values onto base values.
