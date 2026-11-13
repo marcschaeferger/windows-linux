@@ -81,6 +81,14 @@ func main() {
 		os.Exit(2)
 	}
 
+	// One UI per user, even before the daemon is reachable (the daemon only
+	// knows the UIs that attached to it).
+	if err := managers.AcquireUILock(); errors.Is(err, managers.ErrUIAlreadyRunning) {
+		logger.Info("Pangolin is already running; asking it to show itself")
+		managers.RequestUIAction(managers.UIActionShow)
+		return
+	}
+
 	var warning string
 	reader, writer, events, err := managers.AttachUI()
 	switch {
@@ -96,6 +104,7 @@ func main() {
 		}
 		return
 	case err != nil:
+		// The UI keeps trying to attach in the background.
 		logger.Error("Failed to connect to the Pangolin daemon: %v", err)
 		warning = daemonUnavailableWarning()
 	default:
