@@ -31,7 +31,7 @@ func runUI(startupWarning string) error {
 	// When any authenticated request gets 401, mark the session expired.
 	// This runs asynchronously, as walk's Synchronize did, because the request
 	// may have been made while the auth manager holds its lock.
-	apiClient.SetOnUnauthorized(func() {
+	apiClient.SetOnUnauthorized(func(string) {
 		go authManager.MarkSessionExpired()
 	})
 
