@@ -83,6 +83,7 @@ func Run() error {
 	if err := os.Chmod(runtimeDir, 0o755); err != nil {
 		return err
 	}
+	startStaleDNSCleanup()
 	socketPath := daemonSocketPath()
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return err

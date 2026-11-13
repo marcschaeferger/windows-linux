@@ -17,6 +17,7 @@ import (
 const usage = `Usage: pangolin-client [--autostart]
        pangolin-client --daemon
        pangolin-client --tunnel <config.json>
+       pangolin-client --dns-watchdog --parent-pid=<pid> [--interface=<name>] [--socket=<path>]
 `
 
 // daemonUnavailableWarning is shown when the UI can't reach the daemon, with
@@ -56,6 +57,14 @@ func main() {
 		}
 		if err := managers.RunTunnelService(string(configJSON)); err != nil {
 			logger.Fatal("Tunnel failed: %v", err)
+		}
+		return
+
+	case len(args) > 0 && args[0] == "--dns-watchdog":
+		// Started by the tunnel's olm while it overrides the system DNS: resets
+		// the DNS if the tunnel process dies without restoring it.
+		if err := runDNSWatchdog(args[1:]); err != nil {
+			logger.Fatal("DNS watchdog failed: %v", err)
 		}
 		return
 

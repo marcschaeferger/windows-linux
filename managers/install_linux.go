@@ -52,6 +52,7 @@ func InstallTunnel(configJSON string) error {
 	if name == "" {
 		name = "pangolin-tunnel"
 	}
+	waitForStaleDNSCleanup()
 	if err := UninstallTunnel(name); err != nil {
 		return fmt.Errorf("failed to stop running tunnel: %w", err)
 	}
