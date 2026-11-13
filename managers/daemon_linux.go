@@ -264,6 +264,7 @@ func attachUI(conn *net.UnixConn, uid uint32, pid int32) {
 	}
 
 	key := strconv.FormatUint(uint64(uid), 10)
+	rememberUserConfigDir(uid, pid)
 	logger.Info("UI attached for uid %d", uid)
 	done := IPCServerListen(pipes.ourReader, pipes.ourWriter, pipes.ourEvents, tokenForUID(uid), key, uid)
 	go func() {
