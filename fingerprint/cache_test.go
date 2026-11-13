@@ -1,6 +1,7 @@
 package fingerprint
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -9,7 +10,8 @@ func resetPostureCache() {
 	postureMemMu.Lock()
 	defer postureMemMu.Unlock()
 	postureMemFP, postureMemPostures, postureMemOK, postureMemAt = nil, nil, false, time.Time{}
-	postureFailFP, postureFailPostures, postureFailAt = nil, nil, time.Time{}
+	postureFailFP, postureFailPostures, postureFailAt, postureFailStreak = nil, nil, time.Time{}, 0
+	postureLastRefreshAt, postureLastRefreshOK = time.Time{}, false
 }
 
 type fakeGather struct {
@@ -103,5 +105,50 @@ func TestSnapshotMaxAge(t *testing.T) {
 	snap, ok := CachedDevicePostureMaxAge(PostureMaxAgeAtConnect)
 	if !ok || snap.Fingerprint == nil {
 		t.Fatal("recent failure should be remembered")
+	}
+}
+
+func TestRetryDelayBacksOff(t *testing.T) {
+	f := &fakeGather{ok: false}
+	clock := setupPostureTest(t, f)
+
+	want := []time.Duration{PostureRetryInterval, 2 * PostureRetryInterval, 4 * PostureRetryInterval}
+	for i, w := range want {
+		*clock = clock.Add(2 * time.Hour) // each refresh is a separate call
+		RefreshPostureMemory()
+		if got := PostureRetryDelay(); got != w {
+			t.Fatalf("after failure %d: delay %v, want %v", i+1, got, w)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		*clock = clock.Add(2 * time.Hour)
+		RefreshPostureMemory()
+	}
+	if got := PostureRetryDelay(); got != postureRetryMax {
+		t.Fatalf("delay not capped: %v", got)
+	}
+	f.ok = true
+	*clock = clock.Add(2 * time.Hour)
+	RefreshPostureMemory()
+	if got := PostureRetryDelay(); got != PostureRetryInterval {
+		t.Fatalf("delay not reset after success: %v", got)
+	}
+}
+
+func TestConcurrentRefreshesShareOneGather(t *testing.T) {
+	f := &fakeGather{ok: true}
+	setupPostureTest(t, f)
+	// The fake clock does not advance, so a call that started before the
+	// previous refresh finished counts as covered by it.
+	RefreshPostureMemory()
+	callsAfterFirst := f.calls
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); RefreshPostureMemory() }()
+	}
+	wg.Wait()
+	if f.calls != callsAfterFirst {
+		t.Fatalf("callers that started before the refresh finished gathered again: %d -> %d", callsAfterFirst, f.calls)
 	}
 }

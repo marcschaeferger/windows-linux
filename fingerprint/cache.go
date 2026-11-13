@@ -16,8 +16,11 @@ const (
 
 	// PostureRetryInterval is how soon a failed gather is retried. Until
 	// then the failure is remembered instead of repeating a slow query on
-	// every call.
+	// every call. Repeated failures back off up to postureRetryMax, so a
+	// machine where the query can never work (PowerShell blocked by policy)
+	// doesn't run it every two minutes forever.
 	PostureRetryInterval = 2 * time.Minute
+	postureRetryMax      = time.Hour
 )
 
 var (
@@ -35,6 +38,13 @@ var (
 	postureFailFP       map[string]any
 	postureFailPostures map[string]any
 	postureFailAt       time.Time
+	postureFailStreak   int
+
+	postureLastRefreshAt time.Time
+	postureLastRefreshOK bool
+
+	// refreshMu makes concurrent refreshes share one gather.
+	refreshMu sync.Mutex
 
 	// Replaced in tests.
 	gatherPosture = gatherDevicePosture
@@ -45,6 +55,19 @@ var (
 // false when the gather failed; the previous good snapshot is then kept, so a
 // transient WMI or PowerShell failure cannot overwrite it with defaults.
 func RefreshPostureMemory() bool {
+	started := now()
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+
+	// Another caller refreshed while this one waited for the lock; use its
+	// result instead of running the slow query again.
+	postureMemMu.RLock()
+	shared, done := postureLastRefreshOK, postureLastRefreshAt
+	postureMemMu.RUnlock()
+	if !done.IsZero() && !done.Before(started) {
+		return shared
+	}
+
 	logger.Debug("Fingerprint: RefreshPostureMemory() starting")
 	fingerprint, posturesStruct, gathered := gatherPosture()
 	fp := fingerprint.ToMap()
@@ -54,13 +77,17 @@ func RefreshPostureMemory() bool {
 
 	postureMemMu.Lock()
 	defer postureMemMu.Unlock()
+	postureLastRefreshAt = now()
 	if !gathered || len(fp) == 0 || len(postures) == 0 {
+		postureLastRefreshOK = false
+		postureFailStreak++
 		postureFailFP, postureFailPostures, postureFailAt = fp, postures, now()
 		logger.Warn("Fingerprint: device posture gathering failed; keeping the last good snapshot (have one: %v)", postureMemOK)
 		return false
 	}
 	postureMemFP, postureMemPostures, postureMemOK, postureMemAt = fp, postures, true, now()
-	postureFailFP, postureFailPostures, postureFailAt = nil, nil, time.Time{}
+	postureFailFP, postureFailPostures, postureFailAt, postureFailStreak = nil, nil, time.Time{}, 0
+	postureLastRefreshOK = true
 	logger.Debug("Fingerprint: RefreshPostureMemory() finished")
 	return true
 }
@@ -68,7 +95,25 @@ func RefreshPostureMemory() bool {
 // recentlyFailedLocked reports whether a gather failed within
 // PostureRetryInterval. Caller holds postureMemMu.
 func recentlyFailedLocked() bool {
-	return !postureFailAt.IsZero() && now().Sub(postureFailAt) < PostureRetryInterval
+	return !postureFailAt.IsZero() && now().Sub(postureFailAt) < retryDelayLocked()
+}
+
+// retryDelayLocked is the wait after the current streak of failed gathers:
+// PostureRetryInterval, doubling per further failure up to postureRetryMax.
+func retryDelayLocked() time.Duration {
+	d := PostureRetryInterval
+	for i := 1; i < postureFailStreak && d < postureRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, postureRetryMax)
+}
+
+// PostureRetryDelay is how long to wait before refreshing again after a
+// failed RefreshPostureMemory.
+func PostureRetryDelay() time.Duration {
+	postureMemMu.RLock()
+	defer postureMemMu.RUnlock()
+	return retryDelayLocked()
 }
 
 // latestLocked returns the good snapshot, else the one from a failed gather.

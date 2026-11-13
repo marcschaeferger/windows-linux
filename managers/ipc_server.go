@@ -533,7 +533,7 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 			for {
 				wait := 3 * time.Hour
 				if !fingerprint.RefreshPostureMemory() {
-					wait = fingerprint.PostureRetryInterval
+					wait = fingerprint.PostureRetryDelay()
 				}
 				time.Sleep(wait)
 			}
