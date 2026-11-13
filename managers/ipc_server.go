@@ -1,7 +1,6 @@
 package managers
 
 import (
-	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -41,6 +40,7 @@ var (
 type ManagerService struct {
 	events        *os.File
 	eventLock     sync.Mutex
+	queue         eventQueue // delivers notifications to the UI in order
 	elevatedToken userToken
 	// clientUserKey identifies the connected user: a SID on Windows, a UID on Linux.
 	clientUserKey string
@@ -515,6 +515,15 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 			if err != nil {
 				return
 			}
+		case InstallCLIAsyncMethodType, CheckForUpdatesAsyncMethodType:
+			var id uint64
+			if decoder.Decode(&id) != nil {
+				return
+			}
+			err = encoder.Encode(errToString(s.startAsync(methodType, id)))
+			if err != nil {
+				return
+			}
 		default:
 			logger.Error("IPC server: ServeConn unknown method type %d, closing connection", methodType)
 			return
@@ -557,43 +566,30 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 		service.eventLock.Unlock()
 		delete(managerServices, service)
 		managerServicesLock.Unlock()
+		service.stopEvents()
 	}()
 	return done
 }
 
 func notifyAll(notificationType NotificationType, adminOnly bool, ifaces ...any) {
+	managerServicesLock.RLock()
+	defer managerServicesLock.RUnlock()
 	if len(managerServices) == 0 {
 		return
 	}
 
-	var buf bytes.Buffer
-	encoder := gob.NewEncoder(&buf)
-	err := encoder.Encode(notificationType)
+	event, err := encodeNotification(notificationType, ifaces...)
 	if err != nil {
 		return
 	}
-	for _, iface := range ifaces {
-		err = encoder.Encode(iface)
-		if err != nil {
-			return
-		}
-	}
 
-	managerServicesLock.RLock()
 	for m := range managerServices {
 		if m.elevatedToken == 0 && adminOnly {
 			continue
 		}
-		go func(m *ManagerService) {
-			m.eventLock.Lock()
-			defer m.eventLock.Unlock()
-			if m.events != nil {
-				m.events.SetWriteDeadline(time.Now().Add(time.Second))
-				m.events.Write(buf.Bytes())
-			}
-		}(m)
+		// In order, per UI (see eventQueue).
+		m.queueEvent(event)
 	}
-	managerServicesLock.RUnlock()
 }
 
 func errToString(err error) string {

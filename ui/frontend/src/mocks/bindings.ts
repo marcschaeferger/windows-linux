@@ -128,7 +128,7 @@ const settings: Settings = {
     ? "Pangolin was installed from the AUR. Update the pangolin-client-bin package with your AUR helper, for example: yay -Syu pangolin-client-bin"
     : "",
   disabled: params.has("disabled"),
-  orgName: "Fossorial", orgMode: params.has("orgMode"), managed: params.has("managed") ? ["dnsTunnel", "mtu"] : [],
+  orgId: "org_fossorial", orgName: "Fossorial", orgMode: params.has("orgMode"), managed: params.has("managed") ? ["dnsTunnel", "mtu"] : [],
 };
 
 const status: StatusView = {
@@ -196,7 +196,7 @@ export const PreferencesService = {
   },
   Refresh: () => ok({ ...settings }),
   SetSettingsActive: (v: boolean) => ok(log("settings active", v)),
-  ResetOrg: () => {
+  ResetOrg: (_orgId: string) => {
     settings.orgMode = false;
     return ok({ ...settings });
   },

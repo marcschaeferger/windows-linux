@@ -24,10 +24,14 @@ export function PreferencesTab({ initial }: { initial: Settings }) {
   const [editing, setEditing] = useState<EditField | null>(null);
   const [askingScope, setAskingScope] = useState(false);
   const resolveScope = useRef<(scope: Scope | null) => void>(() => {});
+  // Why the last change was not saved, when no sheet shows it (e.g. a switch).
+  const [notice, setNotice] = useState("");
   const formRef = useRef(form);
   formRef.current = form;
   const disabled = form.disabled;
   // The window re-fetches the server's settings and passes them down as `initial`.
+  // A notice stays until the user's next change: the settings pushed right
+  // after an org switch must not hide why that change was refused.
   useEffect(() => setForm(initial), [initial]);
 
   /** Whether a setting is read-only, because of an administrator or the org's server. */
@@ -58,6 +62,7 @@ export function PreferencesTab({ initial }: { initial: Settings }) {
     const prev = formRef.current;
     const next = { ...prev, ...patch };
     setForm(next);
+    setNotice("");
     const scope = await scopeFor(prev, patch);
     if (scope === null) {
       setForm(prev);
@@ -65,10 +70,24 @@ export function PreferencesTab({ initial }: { initial: Settings }) {
     }
     const result = await PreferencesService.Update(next, scope);
     setForm(result.settings);
+    // A sheet shows errors for its own field; anything else shows above the form.
+    setNotice(result.field ? "" : result.error);
     return result;
   };
-  const toggle = (patch: Partial<Settings>) => report(apply(patch));
-  const resetOrg = () => report(PreferencesService.ResetOrg().then(setForm));
+  /** A switch has no sheet, so any reason its change was refused shows above the form. */
+  const toggle = (patch: Partial<Settings>) =>
+    report(
+      apply(patch).then((result) => {
+        if (result.error) setNotice(result.error);
+      }),
+    );
+  const resetOrg = () =>
+    report(
+      PreferencesService.ResetOrg(formRef.current.orgId).then((settings) => {
+        setForm(settings);
+        setNotice("");
+      }),
+    );
 
   return (
     <>
@@ -76,6 +95,14 @@ export function PreferencesTab({ initial }: { initial: Settings }) {
         {disabled && (
           <div className="rounded-[10px] border border-mac-group-border bg-mac-group px-3 py-2 text-[12px] text-mac-secondary">
             These settings are managed by your administrator.
+          </div>
+        )}
+        {notice && (
+          <div
+            role="alert"
+            className="rounded-[10px] border border-mac-group-border bg-mac-group px-3 py-2 text-[12px] text-mac-danger"
+          >
+            {notice}
           </div>
         )}
         {form.orgName && (
