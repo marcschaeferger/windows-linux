@@ -248,7 +248,7 @@ func collectMenuInputs() menuInputs {
 	}
 
 	if accountManager != nil {
-		for _, a := range accountManager.Accounts {
+		for _, a := range accountManager.Accounts() {
 			a := a
 			in.Accounts = append(in.Accounts, menuAccount{
 				UserID:   a.UserID,

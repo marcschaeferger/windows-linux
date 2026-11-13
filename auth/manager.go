@@ -377,7 +377,7 @@ func (am *AuthManager) handleSuccessfulAuth(user *api.User, hostname string, tok
 
 	// Check if account already exists to use its stored org ID
 	var existingAccount *config.Account
-	if existingAcc, exists := am.accountManager.Accounts[user.UserId]; exists {
+	if existingAcc, exists := am.accountManager.Account(user.UserId); exists {
 		existingAccount = &existingAcc
 	}
 
@@ -777,7 +777,7 @@ func isNotFoundError(err error) bool {
 }
 
 func (am *AuthManager) SwitchAccount(userID string) error {
-	accountToSwitchTo, exists := am.accountManager.Accounts[userID]
+	accountToSwitchTo, exists := am.accountManager.Account(userID)
 	if !exists {
 		return errors.New("account does not exist")
 	}
@@ -863,7 +863,7 @@ func (am *AuthManager) Logout() error {
 	// Try to call logout endpoint (ignore errors)
 	_ = am.apiClient.Logout()
 
-	userID := am.accountManager.ActiveUserID
+	userID := am.accountManager.ActiveUserID()
 
 	// Find the account to switch to afterwards: the first remaining one by
 	// name, as the macOS client does.
@@ -891,7 +891,7 @@ func (am *AuthManager) Logout() error {
 	// Auto-select next available account if one exists
 	if nextAccountID != "" {
 		// Check if the account still exists (it should, since we got it before removal)
-		_, exists := am.accountManager.Accounts[nextAccountID]
+		_, exists := am.accountManager.Account(nextAccountID)
 		if exists {
 			// Switch to the next available account
 			if err := am.SwitchAccount(nextAccountID); err != nil {
@@ -908,8 +908,8 @@ func (am *AuthManager) Logout() error {
 // display name, or "" when there is none.
 func (am *AuthManager) nextAccountAfter(userID string) string {
 	var next *config.Account
-	for id, account := range am.accountManager.Accounts {
-		if id == userID {
+	for _, account := range am.accountManager.Accounts() {
+		if account.UserID == userID {
 			continue
 		}
 		account := account
@@ -933,10 +933,10 @@ func (am *AuthManager) HasSession(userID string) bool {
 // goes through Logout, which switches to the next account. Any other account
 // is removed locally and signed out on its server in the background.
 func (am *AuthManager) DeleteAccount(userID string) error {
-	if userID == am.accountManager.ActiveUserID {
+	if userID == am.accountManager.ActiveUserID() {
 		return am.Logout()
 	}
-	account, ok := am.accountManager.Accounts[userID]
+	account, ok := am.accountManager.Account(userID)
 	if !ok {
 		return nil
 	}

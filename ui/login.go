@@ -210,7 +210,7 @@ func accountEmailForHost(hostname string) string {
 	if active, _ := accountManager.ActiveAccount(); active != nil && normalizeURL(active.Hostname) == hostname {
 		return active.Email
 	}
-	for _, a := range accountManager.Accounts {
+	for _, a := range accountManager.Accounts() {
 		if normalizeURL(a.Hostname) == hostname {
 			return a.Email
 		}
