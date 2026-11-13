@@ -7,6 +7,9 @@ import (
 	"testing"
 )
 
+// systemReadFails makes the fake system loader report a read error.
+var systemReadFails bool
+
 func ptr[T any](v T) *T { return &v }
 
 // newTestManager returns a manager backed by a temp user file and a fake
@@ -20,7 +23,8 @@ func newTestManager(t *testing.T, system *SystemConfig, userJSON string) (*Confi
 		}
 	}
 	sys := system
-	cm := &ConfigManager{configPath: path, loadSystem: func() *SystemConfig { return sys }}
+	cm := &ConfigManager{configPath: path, loadSystem: func() (*SystemConfig, bool) { return sys, !systemReadFails }}
+	systemReadFails = false
 	cm.config = cm.load()
 	return cm, &sys, path
 }
@@ -174,7 +178,6 @@ func TestSystemLockWins(t *testing.T) {
 	}
 
 	// Saving while locked must not unlock it either.
-	cm.SetUserSettingsDisabled(false)
 	cm.SetMTU(1500)
 	if !cm.GetUserSettingsDisabled() || cm.GetMTU() != 1280 {
 		t.Fatalf("lock bypassed through save: locked=%v mtu=%d", cm.GetUserSettingsDisabled(), cm.GetMTU())
@@ -189,11 +192,34 @@ func TestSystemUnlockedKeepsUserOverrides(t *testing.T) {
 	}
 }
 
-func TestSystemLockWithoutAdminValueFallsBackToUserFile(t *testing.T) {
-	// No system lock: the user file may set its own flag (nobody else can lock).
-	cm, _, _ := newTestManager(t, &SystemConfig{}, `{"userSettingsDisabled":true}`)
+// The lock is admin policy: a copy in the user file (frozen there by an older
+// version, or typed by the user) never counts, so removing it from the system
+// config really unlocks.
+func TestUserFileCannotSetLock(t *testing.T) {
+	cm, _, path := newTestManager(t, &SystemConfig{}, `{"userSettingsDisabled":true}`)
+	if cm.GetUserSettingsDisabled() {
+		t.Fatal("user file locked the settings")
+	}
+	cm.SetOnboardingSeenWelcome(true)
+	if got := readUserFile(t, path); got.UserSettingsDisabled != nil {
+		t.Fatalf("stale lock kept in the user file: %+v", got)
+	}
+}
+
+func TestSystemConfigReadErrorKeepsLastGood(t *testing.T) {
+	system := &SystemConfig{Config: Config{UserSettingsDisabled: ptr(true), MTU: ptr(1280)}}
+	cm, sys, _ := newTestManager(t, system, "")
 	if !cm.GetUserSettingsDisabled() {
-		t.Fatal("user-set flag ignored")
+		t.Fatal("lock not applied")
+	}
+
+	// The admin tool is rewriting the file: the read fails (or yields nothing).
+	systemReadFails = true
+	defer func() { systemReadFails = false }()
+	*sys = &SystemConfig{}
+	cm.SetOnboardingSeenWelcome(true)
+	if !cm.GetUserSettingsDisabled() || cm.GetMTU() != 1280 {
+		t.Fatalf("admin policy dropped on a failed read: locked=%v mtu=%d", cm.GetUserSettingsDisabled(), cm.GetMTU())
 	}
 }
 

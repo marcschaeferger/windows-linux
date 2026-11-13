@@ -75,18 +75,31 @@ type ConfigManager struct {
 	// user is the user-owned layer, exactly what is stored in configPath.
 	user       *Config
 	configPath string
-	// loadSystem reads the machine-wide config; LoadSystemConfig unless a test
-	// replaces it.
-	loadSystem func() *SystemConfig
+	// loadSystem reads the machine-wide config (loadSystemConfigChecked unless
+	// a test replaces it).
+	loadSystem func() (*SystemConfig, bool)
+	// lastSystem is the last machine-wide config that was read successfully,
+	// used when a later read fails (file being rewritten by an admin tool), so
+	// a transient error doesn't drop admin policy from the effective config.
+	lastSystem *Config
 	mu         sync.RWMutex
 }
 
 // systemConfig returns the machine-wide settings as a Config.
 func (cm *ConfigManager) systemConfig() *Config {
-	if cm.loadSystem != nil {
-		return configFromSystemConfig(cm.loadSystem())
+	load := cm.loadSystem
+	if load == nil {
+		load = loadSystemConfigChecked
 	}
-	return configFromSystemConfig(LoadSystemConfig())
+	sys, ok := load()
+	if !ok && cm.lastSystem != nil {
+		return copyConfig(cm.lastSystem)
+	}
+	system := configFromSystemConfig(sys)
+	if ok {
+		cm.lastSystem = copyConfig(system)
+	}
+	return system
 }
 
 // NewConfigManager creates a new ConfigManager instance
@@ -432,7 +445,8 @@ func (cm *ConfigManager) SetDefaultServerURL(value string) bool {
 	return cm.save(cfg)
 }
 
-// GetUserSettingsDisabled returns whether user settings are disabled (e.g. by admin policy)
+// GetUserSettingsDisabled returns whether user settings are disabled by admin
+// policy. Only the system config can set it; the user file cannot.
 func (cm *ConfigManager) GetUserSettingsDisabled() bool {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
@@ -441,16 +455,6 @@ func (cm *ConfigManager) GetUserSettingsDisabled() bool {
 		return *cm.config.UserSettingsDisabled
 	}
 	return false
-}
-
-// SetUserSettingsDisabled sets whether user settings are disabled and saves to config
-func (cm *ConfigManager) SetUserSettingsDisabled(disabled bool) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	cfg := cm.getConfigCopy()
-	cfg.UserSettingsDisabled = &disabled
-	return cm.save(cfg)
 }
 
 // GetAuthPath returns the auth path query value for login URLs, or empty string if not set
@@ -619,17 +623,25 @@ func openUIAtLogin(cfg *Config) bool {
 }
 
 func LoadSystemConfig() *SystemConfig {
+	cfg, _ := loadSystemConfigChecked()
+	return cfg
+}
+
+// loadSystemConfigChecked is LoadSystemConfig that also reports whether the
+// result is trustworthy: a missing file is an (empty) config, but an
+// unreadable or unparsable one is not.
+func loadSystemConfigChecked() (*SystemConfig, bool) {
 	data, err := os.ReadFile(systemConfigPath())
 	if err != nil {
-		return &SystemConfig{}
+		return &SystemConfig{}, os.IsNotExist(err)
 	}
 
 	var cfg SystemConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return &SystemConfig{}
+		return &SystemConfig{}, false
 	}
 
-	return &cfg
+	return &cfg, true
 }
 
 // GetSystemLogLevel returns the log level from the system config file
@@ -751,11 +763,13 @@ func configFromSystemConfig(sys *SystemConfig) *Config {
 
 // mergeWithSystem builds the effective config from the machine-wide config and
 // the user-owned file. The user file overrides the system defaults, except for
-// admin policy: a userSettingsDisabled set in the system config always wins,
-// and while it is true every other value the system config sets wins too, so
-// the lock cannot be undone by editing the user file.
+// admin policy: userSettingsDisabled comes from the system config alone (a copy
+// in the user file, e.g. frozen there by an earlier version, is ignored), and
+// while it is true every other value the system config sets wins too, so the
+// lock cannot be undone by editing the user file.
 func mergeWithSystem(system, user *Config) *Config {
 	merged := mergeConfig(system, user)
+	merged.UserSettingsDisabled = nil
 	if system == nil {
 		return merged
 	}
@@ -777,6 +791,7 @@ func mergeWithSystem(system, user *Config) *Config {
 func deriveUserLayer(user, old, next, system *Config) *Config {
 	out := copyConfig(user)
 	old, next, system = copyConfig(old), copyConfig(next), copyConfig(system)
+	defer func() { out.UserSettingsDisabled = nil }() // system-only, see mergeWithSystem
 
 	applyFieldDiff(reflect.ValueOf(out).Elem(), reflect.ValueOf(old).Elem(),
 		reflect.ValueOf(next).Elem(), "Orgs")
