@@ -3,6 +3,7 @@ Type=Application
 Name=Pangolin
 GenericName=Pangolin Client
 Comment=Connect to your Pangolin networks
+TryExec=pangolin-client
 Exec=pangolin-client
 Icon=pangolin-client
 Terminal=false
