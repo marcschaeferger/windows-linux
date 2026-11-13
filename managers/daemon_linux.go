@@ -1,6 +1,7 @@
 package managers
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -273,10 +275,89 @@ func attachUI(conn *net.UnixConn, uid uint32, pid int32) {
 		pipes.closeOurs()
 		detach()
 		logger.Info("UI detached for uid %d", uid)
-		if !installStagedUpdateAfterQuit(uid, key) {
-			relaunchUIIfAlwaysOn(uid, key)
-		}
+		handleUIGone(uid, key, defaultUIGoneActions())
 	}()
+}
+
+// uiGoneActions are what handleUIGone does, replaceable in tests.
+type uiGoneActions struct {
+	stopping      func() bool
+	sleep         func(time.Duration)
+	signedIn      func(uid uint32) bool
+	installUpdate func(uid uint32, key string) bool
+	relaunch      func(uid uint32, key string)
+}
+
+func defaultUIGoneActions() uiGoneActions {
+	return uiGoneActions{
+		stopping: func() bool {
+			attachedUIsLock.Lock()
+			defer attachedUIsLock.Unlock()
+			return daemonStopping
+		},
+		sleep:         time.Sleep,
+		signedIn:      userStillSignedIn,
+		installUpdate: installStagedUpdateAfterQuit,
+		relaunch:      relaunchUIIfAlwaysOn,
+	}
+}
+
+// userStillSignedIn reports whether uid still has a login session. Without
+// logind (OpenRC and other non-systemd setups) sign-out can't be seen, so the
+// user counts as signed in and a vanished UI keeps its Always-On. When loginctl
+// fails (logind restarting during an upgrade, or the user unknown to it),
+// logind's /run/user/<uid> decides.
+func userStillSignedIn(uid uint32) bool {
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return true
+	}
+	if _, err := exec.LookPath("loginctl"); err != nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "loginctl", "show-user", strconv.FormatUint(uint64(uid), 10),
+		"--property=State", "--value").Output()
+	_, statErr := os.Stat("/run/user/" + strconv.FormatUint(uint64(uid), 10))
+	return signedInFromLogind(string(out), err, statErr == nil)
+}
+
+// signedInFromLogind interprets loginctl's State output: active or online is
+// signed in. If loginctl failed it can't tell, and the user's runtime
+// directory, which logind removes at the end of the last session, decides; a
+// user who is only lingering (state "lingering") has no session to relaunch
+// the UI into.
+func signedInFromLogind(state string, loginctlErr error, runtimeDirExists bool) bool {
+	if loginctlErr != nil {
+		return runtimeDirExists
+	}
+	switch strings.TrimSpace(state) {
+	case "active", "online":
+		return true
+	}
+	return false
+}
+
+// handleUIGone runs after uid's UI detached. A UI that went away because its
+// user signed out ends Always-On, as the Windows service does at logoff, and
+// is not relaunched: there is no session to start it in, and trying only
+// produced failed systemd-run attempts and a misleading "keeps exiting" error.
+// Otherwise the user quit or the UI crashed: a downloaded update installs, or
+// Always-On starts the UI again.
+func handleUIGone(uid uint32, key string, a uiGoneActions) {
+	if a.stopping() {
+		// The daemon is shutting down and stops the tunnels itself.
+		return
+	}
+	a.sleep(quitSignOutGrace)
+	if !a.signedIn(uid) {
+		logger.Info("uid %d signed out; not relaunching the UI", uid)
+		setUserAlwaysOn(key, false)
+		return
+	}
+	if !a.installUpdate(uid, key) {
+		a.relaunch(uid, key)
+	}
 }
 
 // quitSignOutGrace is how long after a UI goes away the daemon waits before
