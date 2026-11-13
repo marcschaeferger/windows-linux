@@ -114,10 +114,14 @@ Side channels outside the gob IPC:
    settings for the org, and exit node choice.
 2. It calls IPC `StartTunnel(config)`. The manager attaches the cached device
    posture (`fingerprint.CachedDevicePosture`, with username swapped for the
-   connecting user on Linux via `postureForClient`) and calls
+   connecting user via `postureForClient`) and calls
    `tunnel.StartTunnel` → `InstallTunnel(configJSON)`.
-3. Windows: creates/starts service `PangolinTunnel$olm` running
-   `/tunnelservice <cfg>`. Linux: writes `/run/pangolin-client/tunnels/<name>.json`
+3. Windows: refuses tunnel names outside `[A-Za-z0-9_-]{1,32}`, writes
+   `Pangolin\Tunnels\<name>.json` under LocalSystem's local app data
+   (`C:\Windows\System32\config\systemprofile\AppData\Local`, not ProgramData,
+   where any user can create folders) with a SYSTEM/Administrators-only DACL (it
+   holds the olm secret and session token), then creates/starts service
+   `PangolinTunnel$olm` running `/tunnelservice <cfg>`. Linux: writes `/run/pangolin-client/tunnels/<name>.json`
    (0600) and starts `pangolin-client --tunnel <path>` with `Pdeathsig=SIGTERM`.
 4. The tunnel process runs olm (`tunnel/build.go`), which serves its HTTP API
    on the OLM socket. The UI polls status over that socket
