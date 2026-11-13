@@ -55,7 +55,7 @@ func onboardingState(opened int) OnboardingState {
 		s.AcknowledgedPrivacy = configManager.GetOnboardingAcknowledgedPrivacy()
 	}
 	if accountManager != nil {
-		s.HasAccounts = len(accountManager.Accounts) > 0
+		s.HasAccounts = accountManager.HasAccounts()
 	}
 	return s
 }
@@ -69,7 +69,7 @@ func skipOnboardingForUsedInstall() {
 	if configManager == nil || !configManager.OnboardingNeverStarted() {
 		return
 	}
-	usedBefore := (accountManager != nil && len(accountManager.Accounts) > 0) || configManager.UserConfigExists()
+	usedBefore := (accountManager != nil && accountManager.HasAccounts()) || configManager.UserConfigExists()
 	if dir := webviewUserDataPath(); dir != "" {
 		if _, err := os.Stat(dir); err == nil {
 			usedBefore = true

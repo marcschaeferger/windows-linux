@@ -45,12 +45,12 @@ func currentAccountsView() AccountsView {
 	stateMu.RUnlock()
 	view.TunnelStarting = phaseForState(currentTunnelState()) == phaseStarting
 
-	activeID := accountManager.ActiveUserID
+	activeID := accountManager.ActiveUserID()
 	var orgName string
 	if org := authManager.CurrentOrg(); org != nil {
 		orgName = org.Name
 	}
-	for _, a := range accountManager.Accounts {
+	for _, a := range accountManager.Accounts() {
 		a := a
 		row := AccountRow{
 			UserID:      a.UserID,
@@ -86,7 +86,7 @@ func deleteAccount(userID string) {
 	if authManager == nil || accountManager == nil {
 		return
 	}
-	if _, ok := accountManager.Accounts[userID]; !ok {
+	if _, ok := accountManager.Account(userID); !ok {
 		publish()
 		return
 	}
@@ -106,14 +106,21 @@ func deleteAccount(userID string) {
 		publish()
 	}()
 
-	active := userID == accountManager.ActiveUserID
+	active := userID == accountManager.ActiveUserID()
 	if active {
 		setConnectionError("")
 		setLoggingOut(true)
 		defer setLoggingOut(false)
 		logger.Info("Stopping tunnel before removing the active account")
-		if err := managers.IPCClientStopTunnel(); err != nil {
+		if err := managers.IPCClientStopTunnel(); managers.IsIPCNotConnected(err) {
+			// Without a manager connection this UI started no tunnel.
+			logger.Warn("Not connected to the manager; removing the account without stopping a tunnel")
+		} else if err != nil {
+			// Like switchAccount: don't remove the account while its tunnel may
+			// still be up with its credentials.
 			logger.Error("Failed to stop tunnel before removing account: %v", err)
+			showError(preferencesWindowOrNil(), "Tunnel Shutdown Failed", fmt.Sprintf("Failed to shut down the tunnel, so the account was not removed: %v", err))
+			return
 		}
 	} else {
 		publish()

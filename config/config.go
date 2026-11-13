@@ -138,8 +138,8 @@ func (cm *ConfigManager) save(cfg *Config) bool {
 		return false
 	}
 
-	// Write to file
-	if err := os.WriteFile(cm.configPath, data, 0o644); err != nil {
+	// Write to file, atomically so an interrupted save can't truncate it
+	if err := writeFileAtomic(cm.configPath, data, 0o644); err != nil {
 		logger.Error("Error saving config: %v", err)
 		return false
 	}
@@ -688,7 +688,17 @@ func (cm *ConfigManager) getConfigCopy() *Config {
 
 // loadUserConfig loads the per-user config from disk.
 func (cm *ConfigManager) loadUserConfig() (*Config, bool) {
-	return loadConfigFile(cm.configPath)
+	cfg, ok := loadConfigFile(cm.configPath)
+	if !ok {
+		// The next save replaces a file that didn't parse; keep a copy of it.
+		if data, err := os.ReadFile(cm.configPath); err == nil {
+			var probe Config
+			if json.Unmarshal(data, &probe) != nil {
+				backupCorruptFile(cm.configPath, data, 0o644)
+			}
+		}
+	}
+	return cfg, ok
 }
 
 // loadConfigFile loads a config JSON file. A missing file is not an error.
