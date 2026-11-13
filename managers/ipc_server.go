@@ -177,11 +177,13 @@ func (s *ManagerService) InstallCLI() error {
 }
 
 func (s *ManagerService) StartTunnel(config tunnel.Config) error {
-	snapshot, ok := fingerprint.CachedDevicePosture()
+	// Posture only reaches the server at connect, so don't send a snapshot
+	// from hours ago. If the refresh fails, the last good one is used.
+	snapshot, ok := fingerprint.CachedDevicePostureMaxAge(fingerprint.PostureMaxAgeAtConnect)
 	if !ok {
-		logger.Debug("IPC server: StartTunnel device posture cache miss, refreshing")
+		logger.Debug("IPC server: StartTunnel device posture cache stale or missing, refreshing")
 		fingerprint.RefreshPostureMemory()
-		snapshot, ok = fingerprint.CachedDevicePosture()
+		snapshot, ok = fingerprint.LatestDevicePosture()
 	}
 	if ok {
 		snapshot = postureForClient(snapshot, s.clientUserKey)
@@ -352,7 +354,7 @@ func (s *ManagerService) GetDevicePosture() (fingerprint.DevicePostureSnapshot, 
 	if !ok {
 		logger.Debug("IPC server: GetDevicePosture() cache miss, refreshing")
 		fingerprint.RefreshPostureMemory()
-		snapshot, ok = fingerprint.CachedDevicePosture()
+		snapshot, ok = fingerprint.LatestDevicePosture()
 	}
 	if !ok {
 		return fingerprint.DevicePostureSnapshot{}, errors.New("device posture cache is not available")
@@ -528,11 +530,12 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, clientUserKey string, session uint32) <-chan struct{} {
 	postureRefresherOnce.Do(func() {
 		go func() {
-			fingerprint.RefreshPostureMemory()
-			ticker := time.NewTicker(3 * time.Hour)
-			defer ticker.Stop()
-			for range ticker.C {
-				fingerprint.RefreshPostureMemory()
+			for {
+				wait := 3 * time.Hour
+				if !fingerprint.RefreshPostureMemory() {
+					wait = fingerprint.PostureRetryInterval
+				}
+				time.Sleep(wait)
 			}
 		}()
 	})

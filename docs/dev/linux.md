@@ -117,14 +117,23 @@ the root daemon, cached, refreshed every 3h.
   filled by O.E.M." filtered, with a cached fallback), OS version (`NAME VERSION`
   from os-release), arch as GOARCH (`amd64`, CLI uses `uname -m`).
 - `platformFingerprint` hash: `key=value|…` of os, arch, cpu, DMI sys_vendor,
-  product_name, product_sku, board_vendor, board_name, product_serial. The
-  only per-unit identifier is `product_serial`, so machines of the same model
-  with junk/empty serials (whitebox desktops, cloned VMs) share a hash. A
-  session on 2026-11-06 added `uuid=<product_uuid>` (root-only read) with an
-  `isUsefulUUID` filter for empty/all-0/all-F/placeholder UUIDs, but **that
-  change is not in the code** (never committed; as of `f147784` there's no
-  `product_uuid` in `fingerprint/`). Adding it changes every existing Linux
-  hash once. Windows has the same gap (fix: `Win32_ComputerSystemProduct` UUID).
+  product_name, product_sku, board_vendor, board_name, product_serial. A
+  usable serial gives exactly the hash earlier versions computed (so existing
+  devices keep their fingerprint). Only when there is none (empty, or a junk
+  value like "To be filled by O.E.M.", `isUsefulSerial`) is
+  `machine=<HMAC(machine-id)>` added, so identical machines (whitebox desktops,
+  cloned VMs) no longer collide. The ID is `/etc/machine-id`, else a random
+  per-install ID kept in `fingerprint_cache.json` next to the serial cache
+  (`/var/lib/pangolin-client`). Machines with a junk serial change fingerprint
+  once on upgrade; this matters only if their local OLM credentials are lost
+  and recovery by fingerprint is needed.
+- The CPU part includes `siblings` and `cpu cores`, which follow the online
+  CPUs. The values first seen per CPU model are pinned in
+  `fingerprint_cache.json` so nosmt/hotplug/vCPU changes don't alter the hash.
+- Posture: a gather that fails is never cached as a good snapshot (the last
+  good one is kept); connect refreshes a snapshot older than 5 minutes.
+  `firewallEnabled` counts only INPUT-hook filtering (drop policy, or a
+  drop/reject reached from it), not Docker/libvirt NAT and forward rules.
 - Username: gathered as root, then `postureForClient` swaps in the connecting
   user's name before `StartTunnel` sends it.
 
