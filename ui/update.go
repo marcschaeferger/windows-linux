@@ -211,12 +211,12 @@ func setUpdateInfo(change func(*UpdateInfo)) {
 // startUpdate asks the manager to download and install the update. Progress
 // arrives through handleUpdateProgress.
 func startUpdate() {
-	setUpdateInfo(func(info *UpdateInfo) {
-		info.Phase = updatePhaseDownloading
-		info.Activity = "Preparing to download the update…"
-		info.Error = ""
-		info.BytesDownloaded, info.BytesTotal = 0, 0
-	})
+	// Check and set the phase in one step, so a double click on Install Update
+	// or Try Again doesn't send a second request that fails with "already in progress".
+	if !beginUpdate() {
+		logger.Info("An update is already starting; ignoring the repeated request")
+		return
+	}
 
 	logger.Info("Starting update download via manager...")
 	if err := managers.IPCClientUpdate(); err != nil {
@@ -226,6 +226,41 @@ func startUpdate() {
 			info.Error = fmt.Sprintf("Failed to start update: %v", err)
 		})
 	}
+}
+
+// beginUpdate moves the update window to downloading and reports whether it
+// wasn't already there.
+func beginUpdate() bool {
+	updateMu.Lock()
+	if updateInfo.Phase == updatePhaseDownloading {
+		updateMu.Unlock()
+		return false
+	}
+	updateInfo.Phase = updatePhaseDownloading
+	updateInfo.Activity = "Preparing to download the update…"
+	updateInfo.Error = ""
+	updateInfo.BytesDownloaded, updateInfo.BytesTotal = 0, 0
+	info := updateInfo
+	w := updateWindow
+	updateMu.Unlock()
+	if w != nil {
+		w.EmitEvent(eventUpdateState, info)
+	}
+	return true
+}
+
+// applyProgress records a download progress event in info. A progress event
+// that arrives after the error or completion it preceded is stale and ignored.
+func applyProgress(info *UpdateInfo, dp updater.DownloadProgress) bool {
+	if info.Phase == updatePhaseError || info.Phase == updatePhaseComplete {
+		return false
+	}
+	info.Phase = updatePhaseDownloading
+	if dp.Activity != "" {
+		info.Activity = dp.Activity
+	}
+	info.BytesDownloaded, info.BytesTotal = dp.BytesDownloaded, dp.BytesTotal
+	return true
 }
 
 func handleUpdateProgress(dp updater.DownloadProgress) {
@@ -253,12 +288,13 @@ func handleUpdateProgress(dp updater.DownloadProgress) {
 		setUpdateInfo(func(info *UpdateInfo) { info.Phase = updatePhaseComplete })
 		presentUpdateWindow()
 	default:
-		setUpdateInfo(func(info *UpdateInfo) {
-			info.Phase = updatePhaseDownloading
-			if dp.Activity != "" {
-				info.Activity = dp.Activity
-			}
-			info.BytesDownloaded, info.BytesTotal = dp.BytesDownloaded, dp.BytesTotal
-		})
+		updateMu.Lock()
+		changed := applyProgress(&updateInfo, dp)
+		info := updateInfo
+		w := updateWindow
+		updateMu.Unlock()
+		if changed && w != nil {
+			w.EmitEvent(eventUpdateState, info)
+		}
 	}
 }
