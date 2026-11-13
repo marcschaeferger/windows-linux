@@ -30,7 +30,12 @@ func serveCLISecrets(conn io.ReadWriter, userKey string) {
 		writeCLISecretsResponse(conn, cliSecretsStatusError, []byte("invalid request"))
 		return
 	}
+	serveCLISecretsRequest(conn, userKey, userID)
+}
 
+// serveCLISecretsRequest answers a request for userID that has already been
+// read from conn, for the caller identified by userKey.
+func serveCLISecretsRequest(conn io.Writer, userKey, userID string) {
 	secrets, err := secretStore.Load(userKey, userID)
 	if err != nil {
 		logger.Error("CLI secrets: load secrets failed (userId=%s): %v", userID, err)

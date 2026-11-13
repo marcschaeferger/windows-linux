@@ -84,13 +84,22 @@ func migrateFromCredentialManager() error {
 	}
 
 	logger.Info("Secrets migration: migrating %d account(s) from Credential Manager", len(store.Accounts))
+	failed := 0
 	for userID := range store.Accounts {
 		logger.Info("Secrets migration: user %s starting", userID)
 		if err := migrateUserFromKeyring(userID); err != nil {
+			failed++
 			logger.Warn("Failed to migrate secrets for user %s from Credential Manager: %v", userID, err)
 		} else {
 			logger.Info("Secrets migration: user %s finished", userID)
 		}
+	}
+
+	// Leave the flag unset while any user failed, so the next start retries
+	// them. Users that did migrate had their keyring entries deleted and are
+	// skipped as not found on the retry.
+	if failed > 0 {
+		return fmt.Errorf("secrets migration incomplete: %d of %d account(s) failed, will retry on next start", failed, len(store.Accounts))
 	}
 
 	logger.Info("Secrets migration: writing completion flag")
@@ -125,23 +134,35 @@ func migrateUserFromKeyring(userID string) error {
 		return nil
 	}
 
+	// A user whose migration failed before is retried on every start. Never
+	// let the legacy values overwrite secrets the store already holds (from
+	// a newer login since), but still clear the legacy entries below.
+	if ipc == nil || !ipc.Ready() {
+		return fmt.Errorf("manager IPC is not connected")
+	}
+	current, err := ipc.GetUserSecrets(userID)
+	if err != nil {
+		return fmt.Errorf("failed to read stored secrets for user %s: %w", userID, err)
+	}
+	saveSession := hasSession && current.SessionToken == ""
+	saveOLM := hasOLM && current.OlmId == "" && current.OlmSecret == ""
+
 	update := secretstore.SecretsUpdate{}
-	if hasSession {
+	if saveSession {
 		update.Secrets.SessionToken = sessionToken
 		update.SetSessionToken = true
 	}
-	if hasOLM {
+	if saveOLM {
 		update.Secrets.OlmId = olmID
 		update.Secrets.OlmSecret = olmSecret
 		update.SetOlmId = true
 		update.SetOlmSecret = true
 	}
-	logger.Debug("Secrets migration: saving to DPAPI via IPC (userId=%s)", userID)
-	if ipc == nil || !ipc.Ready() {
-		return fmt.Errorf("manager IPC is not connected")
-	}
-	if err := ipc.SaveUserSecrets(userID, update); err != nil {
-		return fmt.Errorf("failed to save migrated secrets for user %s: %w", userID, err)
+	if saveSession || saveOLM {
+		logger.Debug("Secrets migration: saving to DPAPI via IPC (userId=%s)", userID)
+		if err := ipc.SaveUserSecrets(userID, update); err != nil {
+			return fmt.Errorf("failed to save migrated secrets for user %s: %w", userID, err)
+		}
 	}
 
 	if hasSession {

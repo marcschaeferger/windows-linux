@@ -13,10 +13,14 @@ Double-clicking `Pangolin.exe` (no args):
    `\\.\pipe\pangolin-manager-ui-launch`. If the service is running it
    launches the UI in that session and this process exits. Standard users never
    need SCM access or UAC in this path.
-2. If the pipe isn't there: open SCM. Access denied or service missing →
-   re-run self elevated with `/installmanagerservice` (UAC prompt), which
-   installs/starts the service (`managers.InstallManager`) and requests a UI
-   launch with retry (15s).
+2. If the pipe isn't there: open SCM and the service with query/start rights
+   only (`openManagerServiceForStart`), which standard users have. Service
+   missing → re-run self elevated with `/installmanagerservice` (UAC prompt),
+   which installs/starts the service (`managers.InstallManager`) and requests
+   a UI launch with retry (15s). `InstallManager` only creates the service for
+   an exe under Program Files, and never deletes and re-creates an existing
+   one (it only starts it), so a loose copy of the exe can't take over the
+   MSI's LocalSystem service.
 3. Service stopped → try `service.Start()`, falling back to an elevated
    `net start`. Then request the UI launch.
 

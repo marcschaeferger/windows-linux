@@ -57,33 +57,24 @@ func userSecretsPath(windowsSID, userID string) (string, error) {
 	return path, nil
 }
 
+// ensureCredentialsRoot returns the credentials root, creating it or fixing
+// its owner and DACL as needed. An existing root is never trusted as it is:
+// a standard user can create it under ProgramData before the service does.
 func ensureCredentialsRoot() (string, error) {
 	root := credentialsRoot()
-	if err := verifyNotReparsePoint(root, true); err == nil {
-		return root, nil
-	} else if !os.IsNotExist(err) {
+	if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
 		return "", err
 	}
-
-	if err := os.MkdirAll(root, 0); err != nil {
+	if err := EnsureProtectedDir(root, credentialsRootSDDL); err != nil {
 		return "", err
 	}
-	if err := applySecurityDescriptor(root, credentialsRootSDDL); err != nil {
-		return "", err
-	}
-	return root, verifyNotReparsePoint(root, true)
+	return root, nil
 }
 
+// ensureUserDir creates the per-SID directory, or fixes the owner and DACL of
+// an existing one, so only SYSTEM and Administrators can use it.
 func ensureUserDir(userDir string) error {
-	if err := verifyNotReparsePoint(userDir, true); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Mkdir(userDir, 0); err != nil {
-		return err
-	}
-	return applySecurityDescriptor(userDir, credentialsRootSDDL)
+	return EnsureProtectedDir(userDir, credentialsRootSDDL)
 }
 
 func verifyNotReparsePoint(path string, allowMissing bool) error {
