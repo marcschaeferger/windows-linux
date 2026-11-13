@@ -81,7 +81,7 @@ func InstallCLI(userToken uintptr) error {
 	if err != nil {
 		return err
 	}
-	url, err := release.assetURL(asset)
+	url, sum, err := release.assetURL(asset)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func InstallCLI(userToken uintptr) error {
 	if err := os.Remove(tmpPath); err != nil {
 		return err
 	}
-	if err := downloadCLIAsset(url, tmpPath); err != nil {
+	if err := downloadCLIAsset(url, tmpPath, sum); err != nil {
 		return err
 	}
 	if err := checkELF(tmpPath); err != nil {

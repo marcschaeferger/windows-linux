@@ -39,7 +39,7 @@ func InstallCLI(userToken uintptr) error {
 		return err
 	}
 
-	installerURL, err := release.assetURL(cliInstallerAssetName)
+	installerURL, sum, err := release.assetURL(cliInstallerAssetName)
 	if err != nil {
 		return err
 	}
@@ -48,9 +48,11 @@ func InstallCLI(userToken uintptr) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
+	// The MSI is of no use afterwards and would otherwise pile up in SYSTEM's temp.
+	defer os.RemoveAll(tempDir)
 
 	installerPath := filepath.Join(tempDir, cliInstallerAssetName)
-	if err := downloadCLIAsset(installerURL, installerPath); err != nil {
+	if err := downloadCLIAsset(installerURL, installerPath, sum); err != nil {
 		return err
 	}
 
