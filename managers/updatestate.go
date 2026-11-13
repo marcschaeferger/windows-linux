@@ -162,13 +162,49 @@ func autoDownloadUpdatesEnabled() {
 	}()
 }
 
-// takeStagedUpdate reports whether an update is staged, handing it to the caller to install.
-func takeStagedUpdate() bool {
+// takeStagedUpdate returns the staged update, if there is one, handing it to the
+// caller to install. restoreStagedUpdate puts it back if the install never started.
+func takeStagedUpdate() *updater.StagedUpdate {
 	updateLock.Lock()
 	defer updateLock.Unlock()
-	staged := stagedUpdate != nil
+	staged := stagedUpdate
 	stagedUpdate = nil
 	return staged
+}
+
+func restoreStagedUpdate(staged *updater.StagedUpdate) {
+	if staged == nil {
+		return
+	}
+	updateLock.Lock()
+	defer updateLock.Unlock()
+	if stagedUpdate == nil {
+		stagedUpdate = staged
+	}
+}
+
+// progressInterval is the least time between download progress notifications to
+// the UI; a download otherwise sends one per 32 KiB.
+const progressInterval = 250 * time.Millisecond
+
+// progressThrottle thins out download progress. Errors, completion and a new
+// activity always pass.
+type progressThrottle struct {
+	interval time.Duration
+	last     time.Time
+	activity string
+}
+
+func newProgressThrottle(interval time.Duration) *progressThrottle {
+	return &progressThrottle{interval: interval}
+}
+
+func (t *progressThrottle) allow(dp updater.DownloadProgress, now time.Time) bool {
+	if dp.Error != nil || dp.Complete || dp.Activity != t.activity || now.Sub(t.last) >= t.interval {
+		t.last, t.activity = now, dp.Activity
+		return true
+	}
+	return false
 }
 
 // installStagedUpdate installs the staged update, if one is waiting and the user in
@@ -217,26 +253,44 @@ func installStagedUpdate(session uint32, launch bool, onFailure func(sessions []
 	logger.Info("Installing update %s in the background", staged.Version())
 	go func() {
 		stopActiveTunnels()
-		err := updater.InstallStagedInBackground(launchSession)
+		err := installStagedFn(launchSession)
 		if err == nil {
-			// msiexec usually stops this service before getting here.
-			return
+			// The package restarts this process before getting here. If it didn't
+			// (a daemon started by hand, a failed restart), carry on as after a failure.
+			time.Sleep(installRestartGrace)
+			logger.Error("Update %s is installed but this process is still running; resuming", staged.Version())
+		} else {
+			logger.Error("Unable to install update %s: %v", staged.Version(), err)
 		}
-		logger.Error("Unable to install update %s: %v", staged.Version(), err)
-		updater.CancelUIRelaunchAfterUpdate()
-		updateLock.Lock()
-		installingStagedUpdate = false
-		sessions := pendingLaunchSessions
-		pendingLaunchSessions = nil
-		if updateState.HasUpdate() {
-			updateState = UpdateStateFoundUpdate
-		}
-		updateLock.Unlock()
-		if onFailure != nil {
-			onFailure(sessions)
-		}
+		finishStagedInstall(onFailure)
 	}()
 	return true
+}
+
+// installStagedFn and installRestartGrace are variables for tests.
+var (
+	installStagedFn     = updater.InstallStagedInBackground
+	installRestartGrace = time.Minute
+)
+
+// finishStagedInstall ends a background install that didn't replace this
+// process: UI launches held back by it go ahead, and the update can be
+// installed again. A package that is still staged, such as one that found the
+// package manager locked, is picked up again.
+func finishStagedInstall(onFailure func(sessions []uint32)) {
+	updater.CancelUIRelaunchAfterUpdate()
+	updateLock.Lock()
+	installingStagedUpdate = false
+	sessions := pendingLaunchSessions
+	pendingLaunchSessions = nil
+	if updateState.HasUpdate() {
+		updateState = UpdateStateFoundUpdate
+	}
+	updateLock.Unlock()
+	loadStagedUpdate()
+	if onFailure != nil {
+		onFailure(sessions)
+	}
 }
 
 func queueUIRelaunchAfterUpdate(session uint32) {
@@ -282,15 +336,22 @@ func checkForUpdates() {
 	noError, didNotify := true, false
 	for {
 		update, err := updater.CheckForUpdate()
+		var stageErr error
 		if err == nil && update != nil && autoDownloadUpdatesWanted() {
-			err = stageUpdate(update.Version())
+			stageErr = stageUpdate(update.Version())
 		}
 		if err == nil && update != nil {
+			// Tell the user about the update even if downloading it failed.
 			if state, changed := setFoundUpdate(update.Version()); changed {
 				logger.Info("An update is available")
 				IPCServerNotifyUpdateFound(state)
 			}
 			didNotify = true
+			if stageErr != nil {
+				logger.Error("Update checker: unable to download update %s: %v", update.Version(), stageErr)
+				jitterSleep(time.Minute*25, time.Minute*30)
+				continue
+			}
 		} else if err != nil {
 			logger.Error("Update checker: %v", err)
 			if !didNotify {

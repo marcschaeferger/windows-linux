@@ -396,8 +396,9 @@ func InstallStagedInBackground(session uint32) error {
 
 // DownloadVerifyAndExecute installs the latest update, reporting progress on the
 // returned channel. With useStaged set, the staged update is installed instead of
-// downloading again.
-func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) (progress chan DownloadProgress) {
+// downloading again. onStart, if set, is called once the update has really begun;
+// an update refused up front never calls it.
+func DownloadVerifyAndExecute(userToken uintptr, useStaged bool, onStart func()) (progress chan DownloadProgress) {
 	progress = make(chan DownloadProgress, 128)
 	progress <- DownloadProgress{Activity: "Initializing"}
 
@@ -411,6 +412,9 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) (progress chan 
 	release := sync.OnceFunc(func() { atomic.StoreUint32(&updateInProgress, 0) })
 	doIt := func() {
 		defer release()
+		if onStart != nil {
+			onStart()
+		}
 		logger.Info("Updater: DownloadVerifyAndExecute started (userToken=%v, useStaged=%v)", userToken != 0, useStaged)
 
 		if !useStaged {

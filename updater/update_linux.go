@@ -134,8 +134,11 @@ var updateInProgress atomic.Bool
 // downloaded in the background is installed instead of downloading again.
 // userToken is non-zero when the requesting user may install updates; a
 // staged update may be installed by anyone, as it would be when they quit
-// Pangolin. Progress, and any error, arrive on the returned channel.
-func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) chan DownloadProgress {
+// Pangolin. Progress, and any error, arrive on the returned channel. onStart,
+// if set, is called once the update has really begun, before anything is
+// downloaded; an update that is refused up front (no administrator, already in
+// progress) never calls it.
+func DownloadVerifyAndExecute(userToken uintptr, useStaged bool, onStart func()) chan DownloadProgress {
 	progress := make(chan DownloadProgress, 128)
 	progress <- DownloadProgress{Activity: "Initializing"}
 	if userToken == 0 && !useStaged {
@@ -149,6 +152,9 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) chan DownloadPr
 	if !updateInProgress.CompareAndSwap(false, true) {
 		progress <- DownloadProgress{Error: errors.New("an update is already in progress")}
 		return progress
+	}
+	if onStart != nil {
+		onStart()
 	}
 	go func() {
 		defer updateInProgress.Store(false)
