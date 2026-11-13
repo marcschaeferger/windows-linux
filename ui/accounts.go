@@ -7,7 +7,6 @@ import (
 
 	"github.com/fosrl/newt/logger"
 	"github.com/fosrl/windows-linux/auth"
-	"github.com/fosrl/windows-linux/managers"
 )
 
 // AccountRow is one account in Preferences > Accounts.
@@ -111,8 +110,11 @@ func deleteAccount(userID string) {
 		setConnectionError("")
 		setLoggingOut(true)
 		defer setLoggingOut(false)
+		// Removing the active account switches to the next one, whose org
+		// settings the settings window must show.
+		defer emitPreferencesSettings()
 		logger.Info("Stopping tunnel before removing the active account")
-		if err := managers.IPCClientStopTunnel(); err != nil {
+		if err := stopTunnelForAccountChange(); err != nil {
 			logger.Error("Failed to stop tunnel before removing account: %v", err)
 		}
 	} else {

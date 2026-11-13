@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/fosrl/newt/logger"
-	"github.com/fosrl/windows-linux/managers"
 )
 
 const cloudHostname = "https://app.pangolin.net"
@@ -299,9 +298,11 @@ func performLogin(s *loginSession, ctx context.Context, hostname string) {
 
 	// Always stop any running tunnel after login.
 	logger.Info("Stopping tunnel after successful login")
-	if err := managers.IPCClientStopTunnel(); err != nil {
+	if err := stopTunnelForAccountChange(); err != nil {
 		logger.Error("Failed to stop tunnel after login: %v", err)
 	}
+	// The new account's org settings replace the ones on screen.
+	emitPreferencesSettings()
 	withSession(s, func() {
 		s.loggingIn = false
 		s.succeeded = true

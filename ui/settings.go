@@ -43,6 +43,10 @@ type Settings struct {
 	AutoDownloadUpdatesUnavailable string `json:"autoDownloadUpdatesUnavailable"`
 	// Disabled is set when an administrator has turned off user settings.
 	Disabled bool `json:"disabled"`
+	// OrgID is the org the form was filled in for, empty if there is none. A
+	// save for another org than the current one is refused, because the form
+	// shows that org's values.
+	OrgID string `json:"orgId"`
 	// OrgName is the current org, empty if there is none.
 	OrgName string `json:"orgName"`
 	// OrgMode is set when the current org has its own settings.
@@ -59,8 +63,9 @@ type PrefsOpened struct {
 	Login *LoginRequest `json:"login"`
 }
 
-// currentOrgInfo returns the current org's ID and name, or "" for both.
-func currentOrgInfo() (string, string) {
+// currentOrgInfo returns the current org's ID and name, or "" for both. It is
+// a variable so tests can select an org without an AuthManager.
+var currentOrgInfo = func() (string, string) {
 	if authManager == nil {
 		return "", ""
 	}
@@ -232,6 +237,7 @@ func currentSettings() Settings {
 		AutoDownloadUpdates:            cm.GetAutoDownloadUpdates(),
 		AutoDownloadUpdatesUnavailable: autoDownloadUpdatesUnavailable(),
 		Disabled:                       cm.GetUserSettingsDisabled(),
+		OrgID:                          orgID,
 		OrgName:                        orgName,
 		OrgMode:                        !cm.GetOrgConfig(orgID).IsEmpty(),
 		Managed:                        managedFields(server),
@@ -322,22 +328,40 @@ func applySettings(form Settings, scope string) SettingsResult {
 	secondaryDNS := strings.TrimSpace(form.SecondaryDNS)
 	mtuText := strings.TrimSpace(form.MTU)
 
+	prev := currentSettings()
 	invalid := func(field, message string) SettingsResult {
-		return SettingsResult{Settings: currentSettings(), Field: field, Error: message}
+		return SettingsResult{Settings: prev, Field: field, Error: message}
 	}
-	mtu, err := strconv.Atoi(mtuText)
-	if mtuText == "" || err != nil || mtu < minMTU || mtu > maxMTU {
-		return invalid("mtu", fmt.Sprintf("Enter an integer between %d and %d (e.g., 1280)", minMTU, maxMTU))
+	if form.OrgID != prev.OrgID {
+		// The org changed after the form was shown (from the tray or the
+		// Accounts tab). Its values belong to the other org, so saving them
+		// here would copy them into this one.
+		return invalid("", "The organization changed, so its settings are shown now. Make the change again.")
 	}
-	if primaryDNS != "" && !isValidIPAddress(primaryDNS) {
+
+	// Only fields the user changed are checked. The others show the values in
+	// effect, which can come from the org's server or a hand-edited config
+	// file; they are not this change's to fix and must not block it.
+	changing := func(field string, value, shown string) bool {
+		return value != shown && !slices.Contains(prev.Managed, field)
+	}
+	mtu, _ := strconv.Atoi(prev.MTU)
+	if changing("mtu", mtuText, prev.MTU) {
+		var err error
+		mtu, err = strconv.Atoi(mtuText)
+		if mtuText == "" || err != nil || mtu < minMTU || mtu > maxMTU {
+			return invalid("mtu", fmt.Sprintf("Enter an integer between %d and %d (e.g., 1280)", minMTU, maxMTU))
+		}
+	}
+	if changing("primaryDns", primaryDNS, prev.PrimaryDNS) && primaryDNS != "" && !isValidIPAddress(primaryDNS) {
 		return invalid("primaryDns", "Enter an IP address for the DNS server (e.g., 1.1.1.1)")
 	}
-	if secondaryDNS != "" && !isValidIPAddress(secondaryDNS) {
+	if changing("secondaryDns", secondaryDNS, prev.SecondaryDNS) && secondaryDNS != "" && !isValidIPAddress(secondaryDNS) {
 		return invalid("secondaryDns", "Enter an IP address for the DNS server (e.g., 1.1.1.1)")
 	}
 
-	changes := tunnelChanges(currentSettings(), form, mtu, primaryDNS, secondaryDNS)
-	orgID, _ := currentOrgInfo()
+	changes := tunnelChanges(prev, form, mtu, primaryDNS, secondaryDNS)
+	orgID := prev.OrgID
 	saveToOrg := scope == settingsScopeOrg && orgID != ""
 
 	// Start from the current config so fields not on this form (e.g.
@@ -373,11 +397,18 @@ func applySettings(form Settings, scope string) SettingsResult {
 }
 
 // resetOrgSettings makes the current org use the global settings again.
-func resetOrgSettings() Settings {
+// formOrgID is the org the Preferences tab showed; if the current org is
+// another one by now, nothing is reset and its settings are returned.
+func resetOrgSettings(formOrgID string) Settings {
 	if configManager == nil || configManager.GetUserSettingsDisabled() {
 		return currentSettings()
 	}
-	if orgID, _ := currentOrgInfo(); orgID != "" && !configManager.ResetOrgConfig(orgID) {
+	orgID, _ := currentOrgInfo()
+	if orgID != formOrgID {
+		logger.Info("Not resetting org settings: the organization changed")
+		return currentSettings()
+	}
+	if orgID != "" && !configManager.ResetOrgConfig(orgID) {
 		showError(preferencesWindowOrNil(), "Save Failed", "Failed to save settings. Please try again.")
 	}
 	return currentSettings()

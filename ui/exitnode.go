@@ -201,6 +201,7 @@ func onTunnelStateForExitNodes(state tunnel.State) {
 	case tunnel.StateRunning:
 		// Connecting applies the saved exit node, so pick up the result.
 		refreshExitNodes()
+		go reconcileTunnelOrg()
 	case tunnel.StateStopped:
 		resetOLMGatewayStatus()
 	}
@@ -342,9 +343,36 @@ func resolveSavedExitNode(orgID string) (int, []int, error) {
 	return 0, nil, nil
 }
 
+// reconcileTunnelOrg moves the tunnel to the selected org if olm runs with
+// another one. An org switch can only be passed to olm while the tunnel is
+// up, so a switch that lands while it is connecting or dropped out (or a
+// connect that read the org just before the switch) is caught up here once
+// the tunnel is up again.
+func reconcileTunnelOrg() {
+	if tunnelManager == nil || authManager == nil {
+		return
+	}
+	org := authManager.CurrentOrg()
+	if org == nil {
+		return
+	}
+	status, err := tunnelManager.GetOLMStatus()
+	if err != nil || status.OrgID == "" || status.OrgID == org.Id {
+		return
+	}
+	logger.Info("Tunnel runs with organization %s, but %s is selected; switching it", status.OrgID, org.Id)
+	if err := tunnelManager.SwitchOLMOrg(org.Id); err != nil {
+		logger.Error("Failed to switch tunnel organization: %v", err)
+		return
+	}
+	syncExitNodeAfterOrgSwitch(org.Id)
+}
+
 func syncExitNodeAfterOrgSwitch(orgID string) {
 	go func() {
 		fetchServerSettings(orgID)
+		// The new org's server may manage other settings than the old one's.
+		emitPreferencesSettings()
 		if tunnelManager != nil && tunnelManager.State() == tunnel.StateRunning {
 			if resourceID, siteIDs, err := resolveSavedExitNode(orgID); err != nil {
 				// Leave olm's current routing alone rather than dropping it.
