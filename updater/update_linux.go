@@ -105,8 +105,17 @@ func CheckForUpdate() (*UpdateFound, error) {
 // helper keeps up to date, and builds installed by hand. Both are empty when
 // the app can install updates.
 func ManualUpdate() (instructions, command string) {
-	switch packageFormat() {
-	case formatDeb, formatRPM, formatArch:
+	return manualUpdateFor(packageFormat())
+}
+
+func manualUpdateFor(format string) (instructions, command string) {
+	switch format {
+	case formatRPM:
+		if imageBased() {
+			return ostreeUpdateInstructions()
+		}
+		return "", ""
+	case formatDeb, formatArch:
 		return "", ""
 	case formatAUR:
 		return "Pangolin was installed from the AUR. Update the pangolin-client-bin package with your AUR helper, for example:",
