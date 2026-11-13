@@ -40,13 +40,14 @@ func invokeMenuItem(id string) {
 		showUpdateWindow()
 	case id == menuIDReAuth:
 		// Log in again to the active account, from Preferences > Accounts.
-		var hostname string
+		req := &LoginRequest{}
 		if accountManager != nil {
 			if active, _ := accountManager.ActiveAccount(); active != nil {
-				hostname = active.Hostname
+				req.Hostname = active.Hostname
+				req.UserID = active.UserID
 			}
 		}
-		showPreferencesWindow(prefsTabAccounts, &LoginRequest{Hostname: hostname})
+		showPreferencesWindow(prefsTabAccounts, req)
 	case id == menuIDConnect:
 		toggleConnection()
 	case id == menuIDLogin, id == menuIDAddAccount:

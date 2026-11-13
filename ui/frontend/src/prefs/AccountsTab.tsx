@@ -10,7 +10,7 @@ import { AddAccountSheet } from "./AddAccountSheet";
 // screen until there is an account, then the list of accounts with Switch,
 // Log In… and Remove… on each row.
 
-type SheetRequest = { key: number; hostname: string };
+type SheetRequest = { key: number; hostname: string; userId: string };
 
 export function AccountsTab({
   visible,
@@ -36,9 +36,9 @@ export function AccountsTab({
   }, [openCount]);
   useEvent<AccountsView>("accounts:state", setView);
 
-  const showLogin = useCallback((hostname: string) => {
+  const showLogin = useCallback((hostname: string, userId = "") => {
     sheetKey.current += 1;
-    setSheet({ key: sheetKey.current, hostname });
+    setSheet({ key: sheetKey.current, hostname, userId });
   }, []);
   // Requests from the tray: Log In…, Add Account… and logging in again.
   const handledLogin = useRef(0);
@@ -46,7 +46,7 @@ export function AccountsTab({
     if (!login || login.id === handledLogin.current) return;
     handledLogin.current = login.id;
     setPendingRemoval(null);
-    showLogin(login.hostname);
+    showLogin(login.hostname, login.userId ?? "");
   }, [login, showLogin]);
 
   const accounts = view.accounts ?? [];
@@ -66,7 +66,7 @@ export function AccountsTab({
                 busy={view.busyUserId === a.userId}
                 anyBusy={busy}
                 tunnelStarting={view.tunnelStarting}
-                onLogIn={() => showLogin(a.hostname)}
+                onLogIn={() => showLogin(a.hostname, a.userId)}
                 onSwitch={() => report(AccountsService.Switch(a.userId))}
                 onRemove={() => setPendingRemoval(a)}
               />
@@ -95,8 +95,18 @@ export function AccountsTab({
           headerAccessory,
         )}
 
-      {sheet && visible && (
-        <AddAccountSheet key={sheet.key} renewHostname={sheet.hostname} onClose={() => setSheet(null)} />
+      {/* The sheet stays mounted while another tab shows: unmounting it would
+          cancel a device login that is waiting for approval in the browser. */}
+      {sheet && (
+        <div hidden={!visible}>
+          <AddAccountSheet
+            key={sheet.key}
+            active={visible}
+            renewHostname={sheet.hostname}
+            renewUserId={sheet.userId}
+            onClose={() => setSheet(null)}
+          />
+        </div>
       )}
       {pendingRemoval && visible && (
         <Alert

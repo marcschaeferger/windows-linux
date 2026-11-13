@@ -385,6 +385,9 @@ type LoginRequest struct {
 	ID int `json:"id"`
 	// Hostname is the server of an account to log in to again, or "" to add one.
 	Hostname string `json:"hostname"`
+	// UserID is the account to log in to again, if known. Several accounts
+	// can share a server.
+	UserID string `json:"userId"`
 }
 
 // currentPrefsOpened must be called with prefsMu held.

@@ -73,10 +73,13 @@ type LoginService struct{}
 func (LoginService) State() LoginView { return currentLoginView() }
 
 // Open starts a session for a newly shown sheet; renewHostname is the server
-// of an account to log in to again, or "" to add an account.
-func (LoginService) Open(renewHostname string) LoginView { return loginOpen(renewHostname) }
-func (LoginService) Start(hostname string)               { loginStart(hostname) }
-func (LoginService) Back()                               { loginBack() }
+// of an account to log in to again, or "" to add an account, and renewUserID
+// that account's user ID, if known.
+func (LoginService) Open(renewHostname, renewUserID string) LoginView {
+	return loginOpen(renewHostname, renewUserID)
+}
+func (LoginService) Start(hostname string) { loginStart(hostname) }
+func (LoginService) Back()                 { loginBack() }
 
 // Close ends the sheet's session, cancelling a login that hasn't finished.
 func (LoginService) Close(session int) { loginClose(session) }

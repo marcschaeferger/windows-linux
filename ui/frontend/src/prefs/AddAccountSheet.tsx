@@ -25,7 +25,21 @@ function normalizeServerURL(text: string): string | null {
   return url || null;
 }
 
-export function AddAccountSheet({ renewHostname, onClose }: { renewHostname: string; onClose: () => void }) {
+const ignore = () => {};
+
+export function AddAccountSheet({
+  active = true,
+  renewHostname,
+  renewUserId = "",
+  onClose,
+}: {
+  /** False while another Preferences tab shows; the login keeps running. */
+  active?: boolean;
+  renewHostname: string;
+  /** The account to log in to again, when several share its server. */
+  renewUserId?: string;
+  onClose: () => void;
+}) {
   const [view, setView] = useState<LoginView | null>(null);
   const [server, setServer] = useState<Server>("cloud");
   const [serverURL, setServerURL] = useState("");
@@ -35,7 +49,7 @@ export function AddAccountSheet({ renewHostname, onClose }: { renewHostname: str
   useEffect(() => {
     let closed = false;
     report(
-      LoginService.Open(renewHostname).then((v) => {
+      LoginService.Open(renewHostname, renewUserId).then((v) => {
         session.current = v.session;
         if (closed) {
           report(LoginService.Close(v.session));
@@ -51,7 +65,7 @@ export function AddAccountSheet({ renewHostname, onClose }: { renewHostname: str
       closed = true;
       if (session.current) report(LoginService.Close(session.current));
     };
-  }, [renewHostname]);
+  }, [renewHostname, renewUserId]);
   useEvent<LoginView>("login:state", (v) => {
     if (v.session === session.current) setView(v);
   });
@@ -196,7 +210,7 @@ export function AddAccountSheet({ renewHostname, onClose }: { renewHostname: str
     <Sheet
       width={440}
       footerPadding={16}
-      onCancel={onClose}
+      onCancel={active ? onClose : ignore}
       onSubmit={() => {
         if (step === "success") onClose();
         else if (step === "server") continueLogin();

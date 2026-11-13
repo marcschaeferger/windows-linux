@@ -112,8 +112,15 @@ func deleteAccount(userID string) {
 		setLoggingOut(true)
 		defer setLoggingOut(false)
 		logger.Info("Stopping tunnel before removing the active account")
-		if err := managers.IPCClientStopTunnel(); err != nil {
+		if err := managers.IPCClientStopTunnel(); managers.IsIPCNotConnected(err) {
+			// Without a manager connection this UI started no tunnel.
+			logger.Warn("Not connected to the manager; removing the account without stopping a tunnel")
+		} else if err != nil {
+			// Like switchAccount: don't remove the account while its tunnel may
+			// still be up with its credentials.
 			logger.Error("Failed to stop tunnel before removing account: %v", err)
+			showError(preferencesWindowOrNil(), "Tunnel Shutdown Failed", fmt.Sprintf("Failed to shut down the tunnel, so the account was not removed: %v", err))
+			return
 		}
 	} else {
 		publish()

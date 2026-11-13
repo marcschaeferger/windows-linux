@@ -170,6 +170,10 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 // for example when it was started on its own for development.
 var errIPCNotConnected = errors.New("not connected to the Pangolin manager service")
 
+// IsIPCNotConnected reports whether err means the UI has no manager
+// connection at all, so the manager can't be running anything for it.
+func IsIPCNotConnected(err error) bool { return errors.Is(err, errIPCNotConnected) }
+
 func rpcDecodeError() error {
 	var str string
 	err := rpcDecoder.Decode(&str)

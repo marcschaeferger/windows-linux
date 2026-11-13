@@ -158,9 +158,10 @@ func activeSession() *loginSession {
 }
 
 // loginOpen starts a session for a newly shown sheet. renewHostname is the
-// server of an account to log in to again, or "" to add an account. Renewing,
-// or a server set by the administrator, starts the login right away.
-func loginOpen(renewHostname string) LoginView {
+// server of an account to log in to again, or "" to add an account, and
+// renewUserID that account, if known. Renewing, or a server set by the
+// administrator, starts the login right away.
+func loginOpen(renewHostname, renewUserID string) LoginView {
 	loginEnd()
 
 	s := &loginSession{}
@@ -174,7 +175,7 @@ func loginOpen(renewHostname string) LoginView {
 	if h := normalizeURL(renewHostname); h != "" {
 		s.renewing = true
 		s.fixedHost = true
-		s.renewEmail = accountEmailForHost(h)
+		s.renewEmail = renewAccountEmail(h, renewUserID)
 		autoStart = h
 	} else if configManager != nil {
 		if h := normalizeURL(configManager.GetDefaultServerURL()); h != "" {
@@ -201,21 +202,28 @@ func loginOpen(renewHostname string) LoginView {
 	return currentLoginView()
 }
 
-// accountEmailForHost is the email of the account being renewed: the active
-// account when it is on that server, otherwise any account on it.
-func accountEmailForHost(hostname string) string {
+// renewAccountEmail is the email of the account being renewed: the account
+// userID names when it is on that server, otherwise the active account when it
+// is, otherwise the first account on it by email.
+func renewAccountEmail(hostname, userID string) string {
 	if accountManager == nil {
 		return ""
+	}
+	if userID != "" {
+		if a, ok := accountManager.Account(userID); ok && normalizeURL(a.Hostname) == hostname {
+			return a.Email
+		}
 	}
 	if active, _ := accountManager.ActiveAccount(); active != nil && normalizeURL(active.Hostname) == hostname {
 		return active.Email
 	}
+	var email string
 	for _, a := range accountManager.Accounts() {
-		if normalizeURL(a.Hostname) == hostname {
-			return a.Email
+		if normalizeURL(a.Hostname) == hostname && (email == "" || a.Email < email) {
+			email = a.Email
 		}
 	}
-	return ""
+	return email
 }
 
 // loginStart logs in to hostname, replacing any login in progress.
@@ -230,6 +238,9 @@ func loginStart(hostname string) {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// The cancelled attempt may still be running; it must not show its
+		// code in place of this one's.
+		authManager.ClearDeviceAuth()
 		s.cancel = cancel
 		s.hostname = hostname
 		s.err = ""
@@ -285,24 +296,34 @@ func watchDeviceCode(s *loginSession, ctx context.Context) {
 func performLogin(s *loginSession, ctx context.Context, hostname string) {
 	err := authManager.LoginWithDeviceAuth(ctx, &hostname)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			return
 		}
 		logger.Error("Login failed: %v", err)
-		// Back to the server choice, with the error shown there.
+		// Back to the server choice, with the error shown there. ctx is
+		// checked under the session lock, which loginStart and loginBack
+		// hold while cancelling: a superseded attempt changes nothing.
 		withSession(s, func() {
+			if ctx.Err() != nil {
+				return
+			}
 			s.loggingIn = false
 			s.err = err.Error()
 		})
 		return
 	}
 
-	// Always stop any running tunnel after login.
+	// Always stop any running tunnel after login. The login did switch the
+	// account, even if the sheet moved on meanwhile.
 	logger.Info("Stopping tunnel after successful login")
 	if err := managers.IPCClientStopTunnel(); err != nil {
 		logger.Error("Failed to stop tunnel after login: %v", err)
 	}
 	withSession(s, func() {
+		if ctx.Err() != nil {
+			// A newer attempt owns the sheet now.
+			return
+		}
 		s.loggingIn = false
 		s.succeeded = true
 		if user := authManager.CurrentUser(); user != nil {
