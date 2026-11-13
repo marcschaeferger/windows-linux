@@ -39,9 +39,13 @@ var (
 )
 
 type ManagerService struct {
-	events        *os.File
-	eventLock     sync.Mutex
-	elevatedToken userToken
+	events    *os.File
+	eventLock sync.Mutex
+	// eventQueue holds encoded notifications for the one goroutine that writes
+	// them, so a UI receives them in the order they were sent.
+	eventQueue     chan []byte
+	eventQueueOnce sync.Once
+	elevatedToken  userToken
 	// clientUserKey identifies the connected user: a SID on Windows, a UID on Linux.
 	clientUserKey string
 	// session is the UI's Windows session ID, or its UID on Linux.
@@ -87,6 +91,7 @@ func (s *ManagerService) Quit(stopTunnelsOnQuit bool) (alreadyQuit bool, err err
 	s.events = nil
 	s.eventLock.Unlock()
 	delete(managerServices, s)
+	s.closeEventQueue()
 	managerServicesLock.Unlock()
 
 	if stopTunnelsOnQuit {
@@ -124,7 +129,7 @@ func (s *ManagerService) UpdateVersion() string {
 }
 
 func (s *ManagerService) CheckForUpdates() (UpdateState, error) {
-	update, err := updater.CheckForUpdate()
+	update, err := checkForUpdate()
 	if err != nil {
 		return s.UpdateState(), err
 	}
@@ -151,12 +156,29 @@ func (s *ManagerService) AutoDownloadUpdatesTurnedOn() {
 func (s *ManagerService) Update() {
 	// Install the silently downloaded update, if any, instead of downloading again.
 	staged := takeStagedUpdate()
-	prepareUpdateRestart()
-	progress := updater.DownloadVerifyAndExecute(uintptr(s.elevatedToken), staged)
+	var started atomic.Bool
+	progress := updater.DownloadVerifyAndExecute(uintptr(s.elevatedToken), staged != nil, func() {
+		// Only once the update really starts: an early failure must not leave
+		// a UI relaunch request behind.
+		started.Store(true)
+		prepareUpdateRestart()
+	})
 	go func() {
+		throttle := newProgressThrottle(progressInterval)
 		for {
 			dp := <-progress
-			IPCServerNotifyUpdateProgress(dp)
+			if dp.Error != nil && !started.Load() {
+				// It failed before doing anything, such as "already in progress":
+				// the downloaded update is still there for the next try.
+				restoreStagedUpdate(staged)
+			} else if errors.Is(dp.Error, updater.ErrPackageLocked) {
+				// The install gave up waiting for the package manager but kept the
+				// package, so it is installed on the next quit or launch.
+				reloadStagedUpdate()
+			}
+			if throttle.allow(dp, time.Now()) {
+				IPCServerNotifyUpdateProgress(s, dp)
+			}
 			if dp.Complete || dp.Error != nil {
 				return
 			}
@@ -539,10 +561,12 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 
 	service := &ManagerService{
 		events:        events,
+		eventQueue:    make(chan []byte, eventQueueSize),
 		elevatedToken: elevatedToken,
 		clientUserKey: clientUserKey,
 		session:       session,
 	}
+	go service.writeEvents()
 
 	done := make(chan struct{})
 	go func() {
@@ -556,9 +580,37 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 		service.events = nil
 		service.eventLock.Unlock()
 		delete(managerServices, service)
+		service.closeEventQueue()
 		managerServicesLock.Unlock()
 	}()
 	return done
+}
+
+func encodeNotification(notificationType NotificationType, ifaces ...any) (*bytes.Buffer, bool) {
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(notificationType); err != nil {
+		return nil, false
+	}
+	for _, iface := range ifaces {
+		if err := encoder.Encode(iface); err != nil {
+			return nil, false
+		}
+	}
+	return &buf, true
+}
+
+// notifyOne sends a notification to one UI, if it is still connected.
+func notifyOne(to *ManagerService, notificationType NotificationType, ifaces ...any) {
+	buf, ok := encodeNotification(notificationType, ifaces...)
+	if !ok {
+		return
+	}
+	managerServicesLock.RLock()
+	if managerServices[to] {
+		to.enqueueEvent(buf.Bytes())
+	}
+	managerServicesLock.RUnlock()
 }
 
 func notifyAll(notificationType NotificationType, adminOnly bool, ifaces ...any) {
@@ -566,17 +618,9 @@ func notifyAll(notificationType NotificationType, adminOnly bool, ifaces ...any)
 		return
 	}
 
-	var buf bytes.Buffer
-	encoder := gob.NewEncoder(&buf)
-	err := encoder.Encode(notificationType)
-	if err != nil {
+	buf, ok := encodeNotification(notificationType, ifaces...)
+	if !ok {
 		return
-	}
-	for _, iface := range ifaces {
-		err = encoder.Encode(iface)
-		if err != nil {
-			return
-		}
 	}
 
 	managerServicesLock.RLock()
@@ -584,16 +628,44 @@ func notifyAll(notificationType NotificationType, adminOnly bool, ifaces ...any)
 		if m.elevatedToken == 0 && adminOnly {
 			continue
 		}
-		go func(m *ManagerService) {
-			m.eventLock.Lock()
-			defer m.eventLock.Unlock()
-			if m.events != nil {
-				m.events.SetWriteDeadline(time.Now().Add(time.Second))
-				m.events.Write(buf.Bytes())
-			}
-		}(m)
+		m.enqueueEvent(buf.Bytes())
 	}
 	managerServicesLock.RUnlock()
+}
+
+// eventQueueSize is how many notifications may wait for a UI that reads slowly.
+const eventQueueSize = 1024
+
+// enqueueEvent queues an encoded notification for the UI. It must be called
+// with managerServicesLock held, which closeEventQueue's callers also hold.
+func (s *ManagerService) enqueueEvent(msg []byte) {
+	select {
+	case s.eventQueue <- msg:
+	default:
+		logger.Warn("IPC: dropping a notification for %s: its event queue is full", s.clientUserKey)
+	}
+}
+
+// closeEventQueue ends writeEvents. Callers hold managerServicesLock for
+// writing, after removing s from managerServices.
+func (s *ManagerService) closeEventQueue() {
+	s.eventQueueOnce.Do(func() {
+		if s.eventQueue != nil {
+			close(s.eventQueue)
+		}
+	})
+}
+
+// writeEvents sends queued notifications to the UI one at a time and in order.
+func (s *ManagerService) writeEvents() {
+	for msg := range s.eventQueue {
+		s.eventLock.Lock()
+		if s.events != nil {
+			s.events.SetWriteDeadline(time.Now().Add(time.Second))
+			s.events.Write(msg)
+		}
+		s.eventLock.Unlock()
+	}
 }
 
 func errToString(err error) string {
@@ -607,8 +679,10 @@ func IPCServerNotifyUpdateFound(state UpdateState) {
 	notifyAll(UpdateFoundNotificationType, false, state)
 }
 
-func IPCServerNotifyUpdateProgress(dp updater.DownloadProgress) {
-	notifyAll(UpdateProgressNotificationType, false, dp.Activity, dp.BytesDownloaded, dp.BytesTotal, errToString(dp.Error), dp.Complete)
+// IPCServerNotifyUpdateProgress sends dp to the one UI that asked for the
+// update, as other users' UIs have no update of their own to show it for.
+func IPCServerNotifyUpdateProgress(to *ManagerService, dp updater.DownloadProgress) {
+	notifyOne(to, UpdateProgressNotificationType, dp.Activity, dp.BytesDownloaded, dp.BytesTotal, errToString(dp.Error), dp.Complete)
 }
 
 // IPCServerNotifyUIAction asks the UI in sessionID to perform action. Every UI

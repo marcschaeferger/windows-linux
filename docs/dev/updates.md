@@ -30,9 +30,13 @@ part parsed as uint16) is newer than `version.Number`:
   `archlinux`, `aur`). AUR and hand-installed copies look at `.deb` entries
   just to learn the latest version.
 
-Note: an `-rc.N` version (from an rc tag) won't parse as numeric in
-`versionNewerThanUs`, so rc builds can't be compared. Release manifests should
-list plain X.Y.Z files.
+Versions are compared semver-style (`updater/versions.go`): dotted numeric
+parts, then an optional `-rc.N` pre-release tag, which sorts below the same
+version without it. A build on a stable version is never offered a pre-release
+entry; an rc build is offered newer rcs and the final release. A manifest entry
+whose version doesn't parse is skipped (logged), so one bad file name can't stop
+update checks for everyone. A build whose own version doesn't parse (`dev`) gets
+a "can't compare" error from the check.
 
 Download location: absolute URL, or a path relative to the update server.
 Manifests point at GitHub release assets:
@@ -141,6 +145,12 @@ override exists but is commented out).
   Errors name the unit: `journalctl -u pangolin-client-update-<ts>`.
 - Commands (`installCommand`):
   - deb: `apt-get install -y -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=300 <file>` (fallback `dpkg -i --force-confold`)
+  - The install runs in a transient `systemd-run --wait` unit whose output goes
+    to `/var/lib/pangolin-client/update-install.log` (not a pipe: the package
+    restarts the daemon mid-install). If the output says the rpm transaction
+    lock is taken (dnf5 gives up at once instead of waiting), the install is
+    retried every 5 s for up to 5 minutes; if the lock never frees, the staged
+    package is kept for the next quit/launch instead of being discarded.
   - rpm: `dnf install -y --nogpgcheck` / `zypper --non-interactive install --allow-unsigned-rpm` / `yum install -y --nogpgcheck` / `rpm -U --replacepkgs`
   - Arch: wait up to 5 min for `/var/lib/pacman/db.lck` to go away, then `pacman -U --noconfirm`
 - Packages aren't signed for the package manager; the signed manifest is what

@@ -10,12 +10,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/fosrl/newt/logger"
+	"github.com/fosrl/windows-linux/config"
 	"github.com/fosrl/windows-linux/version"
 	"golang.org/x/crypto/blake2b"
 )
@@ -132,8 +134,11 @@ var updateInProgress atomic.Bool
 // downloaded in the background is installed instead of downloading again.
 // userToken is non-zero when the requesting user may install updates; a
 // staged update may be installed by anyone, as it would be when they quit
-// Pangolin. Progress, and any error, arrive on the returned channel.
-func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) chan DownloadProgress {
+// Pangolin. Progress, and any error, arrive on the returned channel. onStart,
+// if set, is called once the update has really begun, before anything is
+// downloaded; an update that is refused up front (no administrator, already in
+// progress) never calls it.
+func DownloadVerifyAndExecute(userToken uintptr, useStaged bool, onStart func()) chan DownloadProgress {
 	progress := make(chan DownloadProgress, 128)
 	progress <- DownloadProgress{Activity: "Initializing"}
 	if userToken == 0 && !useStaged {
@@ -147,6 +152,9 @@ func DownloadVerifyAndExecute(userToken uintptr, useStaged bool) chan DownloadPr
 	if !updateInProgress.CompareAndSwap(false, true) {
 		progress <- DownloadProgress{Error: errors.New("an update is already in progress")}
 		return progress
+	}
+	if onStart != nil {
+		onStart()
 	}
 	go func() {
 		defer updateInProgress.Store(false)
@@ -291,6 +299,12 @@ func installStaged() error {
 		return err
 	}
 	if err := install(path); err != nil {
+		if errors.Is(err, ErrPackageLocked) {
+			// Another package manager held the lock for the whole wait. The
+			// package is fine, so keep it for the next quit or launch.
+			logger.Error("Updater: %v; keeping the staged update for later", err)
+			return err
+		}
 		discardStagedFiles()
 		return err
 	}
@@ -316,22 +330,79 @@ func install(path string) error {
 	if packageFormat() == formatArch {
 		waitForPacmanLock()
 	}
-	unit := "pangolin-client-update-" + strconv.FormatInt(time.Now().Unix(), 10)
+	logger.Info("Updater: running %s", strings.Join(cmd, " "))
+	return runWithLockRetry(func(attempt int) (string, error) {
+		return runInstallUnit(cmd, attempt)
+	}, packageLockTimeout, packageLockRetryInterval)
+}
+
+// installLogPath receives the output of the package manager. systemd writes it
+// there, not into a pipe, so the install carries on when the package restarts
+// this daemon.
+var installLogPath = filepath.Join(config.GetProgramDataDir(), "update-install.log")
+
+// runInstallUnit runs cmd once in a transient systemd unit and returns what the
+// package manager printed.
+func runInstallUnit(cmd []string, attempt int) (string, error) {
+	os.Remove(installLogPath) // never report the output of an earlier run
+	unit := "pangolin-client-update-" + strconv.FormatInt(time.Now().Unix(), 10) + "-" + strconv.Itoa(attempt)
 	args := append([]string{
 		"--unit=" + unit, "--collect", "--wait", "--quiet",
 		"--description=Pangolin client update",
 		"--setenv=DEBIAN_FRONTEND=noninteractive",
 		// zypper otherwise gives up at once if another zypper holds its lock.
 		"--setenv=ZYPP_LOCK_TIMEOUT=" + strconv.Itoa(int(packageLockTimeout/time.Second)),
+		"--property=StandardOutput=file:" + installLogPath,
+		"--property=StandardError=file:" + installLogPath,
 		"--",
 	}, cmd...)
-	logger.Info("Updater: running %s in %s", strings.Join(cmd, " "), unit)
 	out, err := exec.Command("systemd-run", args...).CombinedOutput()
+	log, _ := os.ReadFile(installLogPath)
+	text := strings.TrimSpace(string(out) + "\n" + string(log))
 	if err != nil {
-		return fmt.Errorf("the package manager couldn't install the update (see journalctl -u %s): %v %s",
-			unit, err, strings.TrimSpace(string(out)))
+		return text, fmt.Errorf("the package manager couldn't install the update (see journalctl -u %s): %v %s",
+			unit, err, tail(text, 500))
 	}
-	return nil
+	return text, nil
+}
+
+// packageLockRetryInterval is the pause between attempts while the package
+// manager's lock is taken.
+const packageLockRetryInterval = 5 * time.Second
+
+// isLockFailure reports whether package manager output says it couldn't get
+// its transaction lock. dnf5 gives up at once ("Failed to obtain rpm
+// transaction lock"), unlike dnf4, which waits; rpm itself says "can't create
+// transaction lock".
+func isLockFailure(output string) bool {
+	return strings.Contains(strings.ToLower(output), "transaction lock")
+}
+
+// runWithLockRetry runs attempt until it succeeds, fails for another reason or
+// timeout has passed with the lock still taken.
+func runWithLockRetry(attempt func(n int) (string, error), timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for n := 0; ; n++ {
+		out, err := attempt(n)
+		if err == nil {
+			return nil
+		}
+		if !isLockFailure(out) {
+			return err
+		}
+		if !time.Now().Add(interval).Before(deadline) {
+			return fmt.Errorf("%w: %v", ErrPackageLocked, err)
+		}
+		logger.Info("Updater: the package manager's lock is taken, trying again in %s", interval)
+		time.Sleep(interval)
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) > n {
+		return "..." + s[len(s)-n:]
+	}
+	return s
 }
 
 // packageLockTimeout is how long an install waits for another package

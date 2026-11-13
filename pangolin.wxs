@@ -14,7 +14,9 @@
            UpgradeCode="165F13D3-9A2F-4AF7-9C68-474A8256B274"
            Compressed="yes">
     
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- An -rc.N build and its final release share ProductVersion X.Y.Z (the workflow strips the suffix),
+         so the final release has to be allowed to upgrade the rc. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Define the directory structure using StandardDirectory for WiX v4 -->

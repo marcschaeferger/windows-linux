@@ -12,7 +12,8 @@ func Arch() string {
 	case "386":
 		return "x86"
 	default:
-		panic("Unrecognized GOARCH")
+		// Source builds for riscv64, ppc64le and so on must not crash the daemon.
+		return runtime.GOARCH
 	}
 }
 

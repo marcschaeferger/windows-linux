@@ -52,7 +52,7 @@ The service (`/managerservice`, `managers/service_windows.go`):
 | Admin token | `managers/token_windows.go` | `userToken = windows.Token` |
 | Secrets | `managers/secretstore/dpapi_windows.go`, `filestore_windows.go` | DPAPI as SYSTEM; dir/file SDDL SYSTEM+Admins only |
 | Credential Manager migration | `secrets/migrate_windows.go` | moves old Credential Manager entries into the service store |
-| CLI install | `managers/cli_installer_windows.go` | downloads CLI release (shared lookup in `managers/cli_release.go`) and runs its installer |
+| CLI install | `managers/cli_installer_windows.go` | downloads CLI release (shared lookup and sha256 check in `managers/cli_release.go`), runs its installer, removes the temp dir |
 | Elevation | `elevate/` | `ShellExecute` runas; `doas_windows.go` runs as SYSTEM |
 | Updater | `updater/downloader_windows.go`, `msirunner_windows.go`, `staged_windows.go`, `authenticode_windows.go`, `winhttp/` | WinHTTP download, Authenticode check, msiexec |
 | Tray | `ui/tray_windows.go` | Wails systray; popup primed off-screen at startup (`primeTrayWindow`); WebView2 draws a stale frame when shown, so the popup opens off-screen at -32000, draws, then moves (`trayOpensOffscreen = true`) |
