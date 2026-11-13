@@ -299,7 +299,7 @@ func installStaged() error {
 		return err
 	}
 	if err := install(path); err != nil {
-		if errors.Is(err, errPackageLocked) {
+		if errors.Is(err, ErrPackageLocked) {
 			// Another package manager held the lock for the whole wait. The
 			// package is fine, so keep it for the next quit or launch.
 			logger.Error("Updater: %v; keeping the staged update for later", err)
@@ -366,10 +366,6 @@ func runInstallUnit(cmd []string, attempt int) (string, error) {
 	return text, nil
 }
 
-// errPackageLocked means another package manager held its lock for the whole
-// wait: the update failed for a reason that will pass.
-var errPackageLocked = errors.New("another package manager holds the transaction lock")
-
 // packageLockRetryInterval is the pause between attempts while the package
 // manager's lock is taken.
 const packageLockRetryInterval = 5 * time.Second
@@ -395,7 +391,7 @@ func runWithLockRetry(attempt func(n int) (string, error), timeout, interval tim
 			return err
 		}
 		if !time.Now().Add(interval).Before(deadline) {
-			return fmt.Errorf("%w: %v", errPackageLocked, err)
+			return fmt.Errorf("%w: %v", ErrPackageLocked, err)
 		}
 		logger.Info("Updater: the package manager's lock is taken, trying again in %s", interval)
 		time.Sleep(interval)

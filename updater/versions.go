@@ -136,7 +136,8 @@ func findCandidate(candidates fileList) (*UpdateFound, error) {
 	logger.Debug("Updater: Looking for files matching prefix: %s, suffix: %s", prefix, suffix)
 	logger.Debug("Updater: Total files in manifest: %d", len(candidates))
 
-	if _, err := parseVersion(currentVersion); err != nil {
+	ours, err := parseVersion(currentVersion)
+	if err != nil {
 		return nil, fmt.Errorf("this build's version %q can't be compared with update versions: %w", currentVersion, err)
 	}
 
@@ -154,6 +155,13 @@ func findCandidate(candidates fileList) (*UpdateFound, error) {
 			if len(candidateVersion) > 128 {
 				logger.Debug("Updater: Version string too long: %d characters", len(candidateVersion))
 				return nil, errors.New("Version length is too long")
+			}
+
+			// Only builds that are on a pre-release already are offered one; a stable
+			// client never installs an rc that ended up in the manifest.
+			if cand, err := parseVersion(candidateVersion); err == nil && len(cand.pre) > 0 && len(ours.pre) == 0 {
+				logger.Debug("Updater: Skipping pre-release %s: this build is not a pre-release", candidateVersion)
+				continue
 			}
 
 			logger.Debug("Updater: Comparing candidate version %s with current version %s", candidateVersion, currentVersion)

@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"errors"
 	"hash"
 
 	"golang.org/x/crypto/blake2b"
@@ -47,3 +48,7 @@ func (u *UpdateFound) Name() string {
 func (u *UpdateFound) Version() string {
 	return u.version
 }
+
+// ErrPackageLocked means an install failed because another package manager held
+// its lock for the whole wait. The staged update is kept: it can be installed later.
+var ErrPackageLocked = errors.New("another package manager holds the transaction lock")

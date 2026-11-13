@@ -1,7 +1,10 @@
 package managers
 
 import (
+	"encoding/gob"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -67,17 +70,37 @@ func TestTakeAndRestoreStagedUpdate(t *testing.T) {
 	}
 }
 
-// A background install that returns without replacing this process must not
-// leave the UI locked out for good.
+// stubUpdateGlobals keeps tests away from the real staged-update directory and
+// restores the update state they change.
+func stubUpdateGlobals(t *testing.T) {
+	t.Helper()
+	oldCancel, oldReload := cancelUIRelaunch, reloadStagedUpdate
+	cancelUIRelaunch, reloadStagedUpdate = func() {}, func() {}
+	updateLock.Lock()
+	oldState, oldVersion, oldStaged, oldInstalling, oldInstalled, oldPending :=
+		updateState, foundVersion, stagedUpdate, installingStagedUpdate, installedVersion, pendingLaunchSessions
+	updateLock.Unlock()
+	t.Cleanup(func() {
+		cancelUIRelaunch, reloadStagedUpdate = oldCancel, oldReload
+		updateLock.Lock()
+		updateState, foundVersion, stagedUpdate, installingStagedUpdate, installedVersion, pendingLaunchSessions =
+			oldState, oldVersion, oldStaged, oldInstalling, oldInstalled, oldPending
+		updateLock.Unlock()
+	})
+}
+
+// A background install that fails, or returns without replacing this process,
+// must not leave the UI locked out for good.
 func TestFinishStagedInstallClearsFlag(t *testing.T) {
+	stubUpdateGlobals(t)
 	updateLock.Lock()
 	installingStagedUpdate = true
 	pendingLaunchSessions = []uint32{1000, 1001}
-	updateState = UpdateStateUpdateDownloaded
+	updateState, foundVersion = UpdateStateUpdateDownloaded, "1.2.0"
 	updateLock.Unlock()
 
 	var got []uint32
-	finishStagedInstall(func(sessions []uint32) { got = sessions })
+	finishStagedInstall("", func(sessions []uint32) { got = sessions })
 
 	if stagedUpdateInstalling() {
 		t.Fatal("installingStagedUpdate is still set")
@@ -85,62 +108,133 @@ func TestFinishStagedInstallClearsFlag(t *testing.T) {
 	if len(got) != 2 || got[0] != 1000 || got[1] != 1001 {
 		t.Fatalf("onFailure sessions = %v, want the held-back launches", got)
 	}
-	updateLock.Lock()
-	pending := pendingLaunchSessions
-	updateLock.Unlock()
-	if len(pending) != 0 {
-		t.Fatalf("pendingLaunchSessions = %v, want empty", pending)
+	state, v := currentUpdateState()
+	if state != UpdateStateFoundUpdate || v != "1.2.0" {
+		t.Fatalf("after a failed install: state = %v, version = %q; want the update offered again", state, v)
 	}
 }
 
-// Notifications must reach a UI in the order they were sent: a stale progress
-// event arriving after the final one used to leave the update window stuck.
-func TestNotificationsKeepOrder(t *testing.T) {
+// An install that worked but didn't restart this process must not be offered or
+// downloaded again, or every quit would reinstall it.
+func TestFinishStagedInstallRemembersInstalledVersion(t *testing.T) {
+	stubUpdateGlobals(t)
+	updateLock.Lock()
+	installingStagedUpdate = true
+	updateState, foundVersion = UpdateStateUpdateDownloaded, "1.2.0"
+	updateLock.Unlock()
+
+	finishStagedInstall("1.2.0", nil)
+
+	state, v := currentUpdateState()
+	if state != UpdateStateUnknown || v != "" {
+		t.Fatalf("state = %v, version = %q; want nothing offered", state, v)
+	}
+	updateLock.Lock()
+	got := installedVersion
+	updateLock.Unlock()
+	if got != "1.2.0" {
+		t.Fatalf("installedVersion = %q", got)
+	}
+}
+
+func TestStageRetryDelay(t *testing.T) {
+	day := 24 * time.Hour
+	for _, tt := range []struct {
+		failures int
+		interval time.Duration
+		want     time.Duration
+	}{
+		{1, day, 30 * time.Minute},
+		{2, day, time.Hour},
+		{3, day, 2 * time.Hour},
+		{6, day, 16 * time.Hour},
+		{7, day, 0}, // would be 32 h: the regular interval takes over
+		{1, time.Hour, 30 * time.Minute},
+		{2, time.Hour, 0},
+		{0, day, 30 * time.Minute},
+	} {
+		if got := stageRetryDelay(tt.failures, tt.interval); got != tt.want {
+			t.Errorf("stageRetryDelay(%d, %v) = %v, want %v", tt.failures, tt.interval, got, tt.want)
+		}
+	}
+}
+
+// Notifications must reach a UI in the order they were sent, and only the UI
+// they were addressed to: a stale progress event arriving after the final one
+// used to leave the update window stuck, and every user's UI got every event.
+func TestNotificationsKeepOrderAndRouting(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Close()
+	other, otherW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
 	svc := &ManagerService{events: w, eventQueue: make(chan []byte, eventQueueSize)}
+	bystander := &ManagerService{events: otherW, eventQueue: make(chan []byte, eventQueueSize)}
 	go svc.writeEvents()
-
-	const n = 200
-	for i := 0; i < n; i++ {
-		svc.enqueueEvent([]byte{byte(i)})
-	}
+	go bystander.writeEvents()
 	managerServicesLock.Lock()
-	svc.closeEventQueue()
+	managerServices[svc], managerServices[bystander] = true, true
 	managerServicesLock.Unlock()
+	t.Cleanup(func() {
+		managerServicesLock.Lock()
+		delete(managerServices, svc)
+		delete(managerServices, bystander)
+		svc.closeEventQueue()
+		bystander.closeEventQueue()
+		managerServicesLock.Unlock()
+		w.Close()
+		otherW.Close()
+	})
 
-	got := make([]byte, 0, n)
-	buf := make([]byte, n)
-	deadline := time.After(5 * time.Second)
-	for len(got) < n {
-		type result struct {
-			n   int
-			err error
-		}
-		ch := make(chan result, 1)
-		go func() { k, err := r.Read(buf); ch <- result{k, err} }()
-		select {
-		case res := <-ch:
-			if res.err != nil {
-				t.Fatalf("read: %v", res.err)
-			}
-			got = append(got, buf[:res.n]...)
-		case <-deadline:
-			t.Fatalf("timed out after %d of %d bytes", len(got), n)
-		}
-	}
+	const n = 300
 	for i := 0; i < n; i++ {
-		if got[i] != byte(i) {
-			t.Fatalf("event %d arrived as %d: out of order", i, got[i])
-		}
+		notifyOne(svc, UpdateProgressNotificationType, "Downloading update", uint64(i), uint64(n), "", false)
 	}
-	w.Close()
+
+	dec := gob.NewDecoder(r)
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < n; i++ {
+			var typ NotificationType
+			var activity, errText string
+			var got, total uint64
+			var complete bool
+			for _, v := range []any{&typ, &activity, &got, &total, &errText, &complete} {
+				if err := dec.Decode(v); err != nil {
+					done <- fmt.Errorf("event %d: %w", i, err)
+					return
+				}
+			}
+			if got != uint64(i) {
+				done <- fmt.Errorf("event %d arrived as %d: out of order", i, got)
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the notifications")
+	}
+
+	// Nothing went to the other UI.
+	otherW.Close()
+	if data, _ := io.ReadAll(other); len(data) != 0 {
+		t.Fatalf("a UI that didn't ask for the update got %d bytes", len(data))
+	}
 }
 
-func TestEnqueueAfterCloseOrWithoutQueueDoesNotPanic(t *testing.T) {
+func TestEnqueueWithoutQueueDoesNotPanic(t *testing.T) {
 	svc := &ManagerService{} // no queue, as in a service that was never served
 	svc.enqueueEvent([]byte("x"))
 	svc.closeEventQueue()

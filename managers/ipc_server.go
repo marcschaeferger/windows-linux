@@ -129,7 +129,7 @@ func (s *ManagerService) UpdateVersion() string {
 }
 
 func (s *ManagerService) CheckForUpdates() (UpdateState, error) {
-	update, err := updater.CheckForUpdate()
+	update, err := checkForUpdate()
 	if err != nil {
 		return s.UpdateState(), err
 	}
@@ -171,6 +171,10 @@ func (s *ManagerService) Update() {
 				// It failed before doing anything, such as "already in progress":
 				// the downloaded update is still there for the next try.
 				restoreStagedUpdate(staged)
+			} else if errors.Is(dp.Error, updater.ErrPackageLocked) {
+				// The install gave up waiting for the package manager but kept the
+				// package, so it is installed on the next quit or launch.
+				reloadStagedUpdate()
 			}
 			if throttle.allow(dp, time.Now()) {
 				IPCServerNotifyUpdateProgress(s, dp)

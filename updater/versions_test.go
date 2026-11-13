@@ -70,7 +70,7 @@ func TestVersionNewerThanUs(t *testing.T) {
 		{"1.2.0-rc.1", "1.2.0-rc.1", false},
 		// ...and a stable build is not offered an RC of the same or an older version.
 		{"1.2.0", "1.2.0-rc.3", false},
-		{"1.1.0", "1.2.0-rc.1", true},
+		{"1.1.0", "1.2.0-rc.1", true}, // plain version order; findCandidate decides who is offered it
 	}
 	for _, tt := range tests {
 		withVersion(t, tt.ours)
@@ -88,7 +88,8 @@ func manifestEntry(version string) string {
 
 func TestFindCandidatePreRelease(t *testing.T) {
 	withVersion(t, "1.2.0")
-	// A broken or pre-release entry must not abort the check for every client.
+	// A broken or pre-release entry must not abort the check for every client,
+	// and a stable client is never offered the pre-release.
 	files := fileList{
 		manifestEntry("garbage"):    {},
 		manifestEntry("1.1.0"):      {},
@@ -102,6 +103,22 @@ func TestFindCandidatePreRelease(t *testing.T) {
 	}
 	if got == nil || got.version != "1.3.0" {
 		t.Fatalf("findCandidate = %+v, want 1.3.0 (the newest, not the first in map order)", got)
+	}
+}
+
+func TestFindCandidateStableSkipsPreRelease(t *testing.T) {
+	withVersion(t, "1.1.0")
+	got, err := findCandidate(fileList{manifestEntry("1.2.0-rc.1"): {}})
+	if err != nil || got != nil {
+		t.Fatalf("findCandidate = %+v, %v; a stable client must not be offered an rc", got, err)
+	}
+}
+
+func TestFindCandidateRCBuildGetsNewerRC(t *testing.T) {
+	withVersion(t, "1.2.0-rc.1")
+	got, err := findCandidate(fileList{manifestEntry("1.2.0-rc.2"): {}, manifestEntry("1.1.0"): {}})
+	if err != nil || got == nil || got.version != "1.2.0-rc.2" {
+		t.Fatalf("findCandidate = %+v, %v; want 1.2.0-rc.2", got, err)
 	}
 }
 

@@ -42,7 +42,7 @@ func TestRunWithLockRetry(t *testing.T) {
 			calls++
 			return "Error: GPG check FAILED", errors.New("exit status 1")
 		}, time.Second, time.Millisecond)
-		if err == nil || errors.Is(err, errPackageLocked) || calls != 1 {
+		if err == nil || errors.Is(err, ErrPackageLocked) || calls != 1 {
 			t.Fatalf("err = %v, calls = %d; want a plain error after one attempt", err, calls)
 		}
 	})
@@ -51,8 +51,8 @@ func TestRunWithLockRetry(t *testing.T) {
 		err := runWithLockRetry(func(int) (string, error) {
 			return locked, errors.New("exit status 1")
 		}, 20*time.Millisecond, 5*time.Millisecond)
-		if !errors.Is(err, errPackageLocked) {
-			t.Fatalf("err = %v, want errPackageLocked", err)
+		if !errors.Is(err, ErrPackageLocked) {
+			t.Fatalf("err = %v, want ErrPackageLocked", err)
 		}
 	})
 }

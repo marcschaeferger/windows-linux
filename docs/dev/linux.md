@@ -94,7 +94,8 @@ and `install-linux` do). pkcheck exit codes: 1 not authorized, 2 no
 authentication agent in the session, 3 cancelled, 127 + "is not registered" =
 policy missing. The install downloads `pangolin-cli_linux_<arch>` from the
 CLI's latest GitHub release (`managers/cli_release.go`, shared with Windows),
-checks it's an ELF, and renames it into `/usr/local/bin/pangolin` (same place
+checks it against the sha256 digest the GitHub release API publishes for the
+asset (a release without one is refused), checks it's an ELF, and renames it into `/usr/local/bin/pangolin` (same place
 `get-cli.sh` uses). Test with network: `PANGOLIN_TEST_CLI_DOWNLOAD=1 go test ./managers -run CLI`.
 
 ## Secrets (`managers/secretstore/filestore_linux.go`)
