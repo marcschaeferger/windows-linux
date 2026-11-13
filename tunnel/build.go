@@ -23,6 +23,9 @@ type tunnelService struct {
 
 // buildTunnel builds the tunnel
 func (s *tunnelService) buildTunnel(config Config) error {
+	// Mask the credentials in everything this process logs from here on,
+	// including the olm library's own dumps of the config.
+	config.RegisterSecrets()
 	logger.Debug("Build tunnel called: config: %+v", config)
 
 	// Create context for OLM

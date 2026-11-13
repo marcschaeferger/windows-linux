@@ -25,5 +25,5 @@ depend() {
 start_pre() {
 	checkpath -d -m 0755 -o root:root /run/pangolin-client
 	checkpath -d -m 0700 -o root:root /var/lib/pangolin-client
-	checkpath -d -m 0755 -o root:root /var/log/pangolin-client
+	checkpath -d -m 0750 -o root:root /var/log/pangolin-client
 }

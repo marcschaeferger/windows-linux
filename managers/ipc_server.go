@@ -14,6 +14,7 @@ import (
 	"github.com/fosrl/newt/logger"
 
 	"github.com/fosrl/windows-linux/fingerprint"
+	"github.com/fosrl/windows-linux/logging"
 	"github.com/fosrl/windows-linux/managers/secretstore"
 	"github.com/fosrl/windows-linux/tunnel"
 	"github.com/fosrl/windows-linux/updater"
@@ -323,6 +324,7 @@ func (s *ManagerService) GetUserSecrets(userID string) (secretstore.UserSecrets,
 		logger.Error("IPC server: GetUserSecrets() failed (userId=%s): %v", userID, err)
 		return secrets, err
 	}
+	logging.RegisterSecrets(secrets.SessionToken, secrets.OlmSecret)
 	logger.Debug("IPC server: GetUserSecrets (userId=%s, hasSessionToken=%v, hasOlmId=%v, hasOlmSecret=%v)",
 		userID, secrets.SessionToken != "", secrets.OlmId != "", secrets.OlmSecret != "")
 	return secrets, err
@@ -513,6 +515,22 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 			}
 			err = encoder.Encode(errToString(retErr))
 			if err != nil {
+				return
+			}
+		case ReadLogMethodType:
+			var offset int64
+			var max int
+			if err = decoder.Decode(&offset); err != nil {
+				return
+			}
+			if err = decoder.Decode(&max); err != nil {
+				return
+			}
+			chunk, retErr := s.ReadLog(offset, max)
+			if err = encoder.Encode(chunk); err != nil {
+				return
+			}
+			if err = encoder.Encode(errToString(retErr)); err != nil {
 				return
 			}
 		default:
