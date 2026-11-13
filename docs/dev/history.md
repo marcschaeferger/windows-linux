@@ -90,10 +90,10 @@ leave changes staged or uncommitted unless asked.
 - `rc` versions can't be compared by the updater (non-numeric part).
 - GNOME extension `metadata.json` url points at the old repo name.
 - `managers/install_linux.go` `errNotImplemented` unused.
-- Fingerprint hash on both OSes has no machine UUID (the Linux `product_uuid`
-  change from 2026-11-06 was never committed) and no `board_serial`, so
-  same-model machines with junk serials collide. Ask the owner before adding:
-  it changes existing hashes once.
+- Fingerprint hash: since the audit fix, machines with a junk/empty serial
+  get a per-install component (`/etc/machine-id`, Windows `MachineGuid`);
+  machines with a real serial keep their old hash. No `board_serial` or
+  `product_uuid`: adding either would change every existing hash.
 - Maintainer email `support@pangolin.net` unconfirmed.
 
 ## Lessons from past sessions

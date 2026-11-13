@@ -3,6 +3,7 @@ package fingerprint
 import (
 	"bufio"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -40,7 +41,7 @@ const (
 
 // gatherDevicePosture collects the fingerprint and posture checks. The daemon
 // runs it as root, which the serial number and firewall checks need.
-func gatherDevicePosture() (*Fingerprint, *PostureChecks) {
+func gatherDevicePosture() (*Fingerprint, *PostureChecks, bool) {
 	logger.Debug("Fingerprint: gatherDevicePosture() starting")
 
 	fp := &Fingerprint{
@@ -76,7 +77,7 @@ func gatherDevicePosture() (*Fingerprint, *PostureChecks) {
 
 	logger.Debug("Fingerprint: gatherDevicePosture() finished (hostname=%q, model=%q, hasSerial=%v)",
 		fp.Hostname, fp.DeviceModel, fp.SerialNumber != "")
-	return fp, postures
+	return fp, postures, true
 }
 
 // resolveSerialNumber reads the DMI serial (root-only) and falls back to the
@@ -105,6 +106,12 @@ func serialCachePath() string {
 
 // cpuFingerprint takes stable fields of the first CPU in /proc/cpuinfo, in the
 // same form as fosrl/cli's Linux client.
+//
+// "siblings" and "cpu cores" count online CPUs only: booting with nosmt,
+// hotplug or a vCPU change alters them without changing the machine. They stay
+// in the hash so fingerprints of devices registered earlier remain valid, but
+// the values first seen for this CPU model are pinned in the fingerprint cache
+// and reused, so the hash no longer follows the online state.
 func cpuFingerprint() string {
 	f, err := os.Open("/proc/cpuinfo")
 	if err != nil {
@@ -112,6 +119,17 @@ func cpuFingerprint() string {
 	}
 	defer f.Close()
 
+	fp, topology := cpuFingerprintFrom(f, loadCPUTopology())
+	if topology != nil {
+		saveCPUTopology(topology)
+	}
+	return fp
+}
+
+// cpuFingerprintFrom builds the CPU part of the fingerprint from cpuinfo
+// content. pinned is the stored topology, if any. The returned topology is
+// non-nil when it should be stored (first use, or a different CPU model).
+func cpuFingerprintFrom(r io.Reader, pinned *cpuTopologyCache) (string, *cpuTopologyCache) {
 	allowed := map[string]string{
 		"vendor_id":       "vendor",
 		"model name":      "model_name",
@@ -125,7 +143,7 @@ func cpuFingerprint() string {
 		"cpu revision":    "revision",
 	}
 	values := make(map[string]string)
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		key, val, ok := strings.Cut(scanner.Text(), ":")
 		if !ok {
@@ -140,13 +158,67 @@ func cpuFingerprint() string {
 		}
 	}
 
+	// Identify the CPU model by the fields that don't depend on online CPUs.
+	var model []string
+	for _, k := range []string{"vendor", "model_name", "family", "model", "stepping", "implementer", "part", "revision"} {
+		model = append(model, k+"="+values[k])
+	}
+	topology := &cpuTopologyCache{
+		Key:      strings.Join(model, "|"),
+		Siblings: values["siblings"],
+		Cores:    values["cores"],
+	}
+	var store *cpuTopologyCache
+	if pinned != nil && pinned.Key == topology.Key {
+		if topology.Siblings != pinned.Siblings || topology.Cores != pinned.Cores {
+			logger.Debug("Fingerprint: CPU topology changed (siblings %q->%q, cores %q->%q); using the pinned values",
+				pinned.Siblings, topology.Siblings, pinned.Cores, topology.Cores)
+		}
+		topology = pinned
+	} else if len(values) > 0 {
+		store = topology
+	}
+	for name, v := range map[string]string{"siblings": topology.Siblings, "cores": topology.Cores} {
+		if v == "" {
+			delete(values, name)
+		} else {
+			values[name] = v
+		}
+	}
+
 	var out []string
 	for _, k := range []string{"vendor", "model_name", "family", "model", "stepping", "cores", "siblings", "implementer", "part", "revision"} {
 		if v, ok := values[k]; ok {
 			out = append(out, k+"="+v)
 		}
 	}
-	return strings.Join(out, "|")
+	return strings.Join(out, "|"), store
+}
+
+// osMachineID returns the identifier of this OS install, /etc/machine-id.
+func osMachineID() string {
+	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
+		if id := validMachineID(readTrimmed(path)); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// validMachineID returns id if it is a usable machine-id: 32 hex digits, not
+// all zero. An image that was never booted has an empty or "uninitialized"
+// file, which says nothing about this machine.
+func validMachineID(id string) string {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if len(id) != 32 || strings.Trim(id, "0") == "" {
+		return ""
+	}
+	for _, c := range id {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return ""
+		}
+	}
+	return id
 }
 
 // dmiFingerprint reads the same DMI fields the Windows client reads from the
@@ -271,8 +343,10 @@ func blockDeviceEncrypted(dev string, depth int) bool {
 	return false
 }
 
-// firewallEnabled uses the same checks as fosrl/cli's Linux client: an active
-// ufw or firewalld, or any nftables or iptables rules.
+// firewallEnabled reports an active ufw or firewalld, or nftables/iptables
+// rules that filter inbound traffic (see firewall_linux.go). fosrl/cli counts
+// any nftables or iptables rule, which Docker, podman and libvirt satisfy
+// without a host firewall.
 func firewallEnabled() bool {
 	if out, ok := runCommand("ufw", "status"); ok && strings.Contains(strings.ToLower(out), "status: active") {
 		return true
@@ -280,15 +354,13 @@ func firewallEnabled() bool {
 	if out, ok := runCommand("firewall-cmd", "--state"); ok && strings.TrimSpace(out) == "running" {
 		return true
 	}
-	if out, ok := runCommand("nft", "list", "ruleset"); ok && strings.TrimSpace(out) != "" {
-		return true
-	}
-	if out, ok := runCommand("iptables", "-S"); ok {
-		for _, line := range strings.Split(out, "\n") {
-			if strings.HasPrefix(line, "-A") {
-				return true
-			}
+	if out, ok := runCommand("nft", "-j", "list", "ruleset"); ok {
+		if filters, parsed := nftInputFilters(out); parsed && filters {
+			return true
 		}
+	}
+	if out, ok := runCommand("iptables", "-S"); ok && iptablesInputFilters(out) {
+		return true
 	}
 	return false
 }
