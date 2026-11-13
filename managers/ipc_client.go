@@ -84,12 +84,38 @@ type UIActionCallback struct {
 
 var uiActionCallbacks = make(map[*UIActionCallback]bool)
 
+// IPCConnectionLostCallback runs when the manager's event pipe closes
+// without an orderly shutdown, for example when the daemon crashed or was
+// restarted by a package upgrade.
+type IPCConnectionLostCallback struct {
+	cb func()
+}
+
+var (
+	ipcConnectionLostCallbacks = make(map[*IPCConnectionLostCallback]bool)
+	ipcConnectionLostLock      sync.Mutex
+)
+
+// ipcConn is the pipes of the current connection, so a lost one can be closed
+// and a new one told apart from it. Guarded by rpcMutex.
+var (
+	ipcConnFiles      []*os.File
+	ipcConnGeneration uint64
+)
+
 func InitializeIPCClient(reader, writer, events *os.File) {
+	rpcMutex.Lock()
+	closeIPCFiles(ipcConnFiles)
+	ipcConnGeneration++
+	generation := ipcConnGeneration
+	ipcConnFiles = []*os.File{reader, writer, events}
 	rpcDecoder = gob.NewDecoder(reader)
 	rpcEncoder = gob.NewEncoder(writer)
+	rpcMutex.Unlock()
 	registerSecretsIPC()
 	registerDevicePostureIPC()
 	go func() {
+		defer ipcConnectionLost(generation)
 		decoder := gob.NewDecoder(events)
 		for {
 			var notificationType NotificationType
@@ -164,6 +190,65 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 			}
 		}
 	}()
+}
+
+func closeIPCFiles(files []*os.File) {
+	for _, f := range files {
+		if f != nil {
+			f.Close()
+		}
+	}
+}
+
+// ipcConnectionLost drops the connection of the given generation, so later
+// RPCs fail with errIPCNotConnected instead of a broken pipe, and tells the
+// registered callbacks. A newer connection is left alone.
+func ipcConnectionLost(generation uint64) {
+	rpcMutex.Lock()
+	if generation != ipcConnGeneration || rpcEncoder == nil {
+		rpcMutex.Unlock()
+		return
+	}
+	rpcEncoder, rpcDecoder = nil, nil
+	closeIPCFiles(ipcConnFiles)
+	ipcConnFiles = nil
+	rpcMutex.Unlock()
+	logger.Warn("IPC: lost the connection to the manager")
+	ipcConnectionLostLock.Lock()
+	callbacks := make([]*IPCConnectionLostCallback, 0, len(ipcConnectionLostCallbacks))
+	for cb := range ipcConnectionLostCallbacks {
+		callbacks = append(callbacks, cb)
+	}
+	ipcConnectionLostLock.Unlock()
+	for _, cb := range callbacks {
+		cb.cb()
+	}
+}
+
+// IPCClientDropConnection treats the current connection as lost now, for when
+// the manager announced it is stopping and its pipes are about to close:
+// later RPCs fail as not connected instead of reaching a stopping manager.
+func IPCClientDropConnection() {
+	rpcMutex.Lock()
+	generation := ipcConnGeneration
+	rpcMutex.Unlock()
+	ipcConnectionLost(generation)
+}
+
+// IPCClientRegisterConnectionLost registers cb to run when the connection to
+// the manager drops.
+func IPCClientRegisterConnectionLost(cb func()) *IPCConnectionLostCallback {
+	s := &IPCConnectionLostCallback{cb}
+	ipcConnectionLostLock.Lock()
+	ipcConnectionLostCallbacks[s] = true
+	ipcConnectionLostLock.Unlock()
+	return s
+}
+
+func (cb *IPCConnectionLostCallback) Unregister() {
+	ipcConnectionLostLock.Lock()
+	delete(ipcConnectionLostCallbacks, cb)
+	ipcConnectionLostLock.Unlock()
 }
 
 // errIPCNotConnected is returned when the UI has no connection to the manager,
@@ -277,6 +362,9 @@ func IPCClientUpdate() error {
 
 	rpcMutex.Lock()
 	defer rpcMutex.Unlock()
+	if rpcEncoder == nil {
+		return errIPCNotConnected
+	}
 
 	return rpcEncoder.Encode(UpdateMethodType)
 }

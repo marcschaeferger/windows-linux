@@ -5,8 +5,10 @@
 #
 # Detects the distribution and CPU architecture, downloads the matching
 # package (deb, rpm or Arch) from the latest Linux release on GitHub and
-# installs it with the system package manager. On other distributions
-# (Gentoo, Void, ...) it installs the tar.gz with its install.sh instead.
+# installs it with the system package manager (rpm-ostree on image-based
+# Fedora). On other distributions (Gentoo, Void, ...) and wherever systemd is
+# not the init (Devuan, Artix, ...) it installs the tar.gz with its install.sh
+# instead.
 #
 # Options:
 #   --format deb|rpm|arch|tar   Skip distribution detection.
@@ -144,10 +146,35 @@ detect_arch() {
     esac
 }
 
+# True when systemd is the running init. The deb, rpm and Arch packages only
+# ship a systemd unit; the tar.gz's install.sh also handles OpenRC.
+has_systemd() {
+    [ -d /run/systemd/system ]
+}
+
+# True inside a container image (Docker, Podman), where there is no init at
+# all and the packages are what a Dockerfile wants.
+in_container() {
+    [ -e /.dockerenv ] || [ -e /run/.containerenv ]
+}
+
+# True on image-based Fedora (Silverblue, Kinoite, ...), where the root
+# filesystem is a read-only ostree and packages are layered with rpm-ostree.
+is_ostree() {
+    [ -e /run/ostree-booted ]
+}
+
 # Package format for this distribution: deb, rpm or arch. Reads
 # /etc/os-release, then falls back to whichever package manager is present,
-# then to the tar.gz.
+# then to the tar.gz. Without systemd (Devuan, MX, Artix, Alpine, ...) the
+# packages would install a service nothing starts, so it is the tar.gz too.
 detect_format() {
+    if ! has_systemd && ! in_container; then
+        print_warning "systemd is not running; the deb, rpm and Arch packages need it, so installing the tar.gz."
+        echo "tar"
+        return
+    fi
+
     ids=""
     if [ -r /etc/os-release ]; then
         # shellcheck disable=SC1091
@@ -212,7 +239,14 @@ install_package() {
             $sudo_cmd apt-get install -y "$file"
             ;;
         rpm)
-            if command -v dnf >/dev/null 2>&1; then
+            if is_ostree; then
+                # dnf can't write to the read-only root; layer the package.
+                if ! command -v rpm-ostree >/dev/null 2>&1; then
+                    print_error "This is an image-based system but rpm-ostree was not found."
+                    exit 1
+                fi
+                $sudo_cmd rpm-ostree install --idempotent "$file"
+            elif command -v dnf >/dev/null 2>&1; then
                 $sudo_cmd dnf install -y "$file"
             elif command -v zypper >/dev/null 2>&1; then
                 # The package isn't signed with a key zypper knows.
@@ -360,6 +394,14 @@ main() {
         print_status "Root privileges are needed to install the package"
     fi
     install_package "$FORMAT" "$package_file" "$SUDO_CMD"
+
+    if [ "$FORMAT" = rpm ] && is_ostree; then
+        # The layered package only appears in the next deployment.
+        print_status "Pangolin ${VERSION} is layered with rpm-ostree."
+        print_status "Reboot to use it, then start the background service once with:"
+        print_status "  sudo systemctl enable --now pangolin-client"
+        exit 0
+    fi
 
     if command -v pangolin-client >/dev/null 2>&1 || [ -x /usr/bin/pangolin-client ] ||
         [ -x /usr/local/bin/pangolin-client ]; then

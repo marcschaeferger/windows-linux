@@ -22,10 +22,8 @@ func registerIPCCallbacks() {
 		// UpdateStateUpdateDownloaded is silent: it installs when the user quits.
 	})
 
-	managers.IPCClientRegisterManagerStopping(func() {
-		logger.Info("Manager service is stopping, exiting UI")
-		app.Quit()
-	})
+	managers.IPCClientRegisterManagerStopping(handleManagerStopping)
+	setupIPCReconnect()
 
 	managers.IPCClientRegisterUpdateProgress(handleUpdateProgress)
 

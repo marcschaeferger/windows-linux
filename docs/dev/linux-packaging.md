@@ -52,7 +52,7 @@ Maintainer field `Fossorial, Inc. <support@pangolin.net>` was a guess in
 `Type=simple`, `ExecStart=/usr/bin/pangolin-client --daemon`,
 `Restart=on-failure`, `RestartSec=2`, `KillMode=mixed`, `TimeoutStopSec=45`,
 `RuntimeDirectory` (0755), `StateDirectory` (0700), `LogsDirectory` (0755) all
-`pangolin-client`, after/wants `network-online.target`, `WantedBy=multi-user.target`.
+`pangolin-client`, `After=network.target` (not `network-online.target`: the daemon only listens on its socket, and waiting for the network delayed it past a fast login), `WantedBy=multi-user.target`. Both `.desktop` files have `TryExec=pangolin-client`, so a removed-but-not-purged deb doesn't leave an autostart entry that points at nothing.
 
 ## Service auto-start and maintainer scripts (`packaging/linux/scripts/`)
 
@@ -140,6 +140,15 @@ No `package-format` file → updates are notify-only. `uninstall-linux` reverses
 
 - Detects arch (`amd64`/`arm64`) and format (deb/rpm/arch from os-release and
   package managers), `--format deb|rpm|arch|tar`, `--version X.Y.Z`.
+- Without systemd as init (`/run/systemd/system` missing: Devuan, MX, Artix, ...)
+  the packages would install a unit nothing starts, so it picks `tar` (which
+  installs the OpenRC script), except inside a container image (no init either
+  way), where the package stays. `--format` overrides.
+- Image-based Fedora (`/run/ostree-booted`: Silverblue, Kinoite): the rpm is
+  layered with `rpm-ostree install --idempotent`, the script tells the user to
+  reboot and enable the service, and the in-app updater shows manual
+  instructions instead of running `dnf`. `scripts/test-get-linux.sh` checks
+  these decisions.
 - Unknown distro → falls back to `tar` with a warning; extracts and runs
   `install.sh` as root; warns if WebKitGTK 4.1 is missing or on musl.
 - Latest version + sha256 checksums come from the Fossorial versions API

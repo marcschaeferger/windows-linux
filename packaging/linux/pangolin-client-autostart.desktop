@@ -2,6 +2,7 @@
 Type=Application
 Name=Pangolin
 Comment=Opens Pangolin at sign-in when that is turned on in its settings
+TryExec=pangolin-client
 Exec=pangolin-client --autostart
 Icon=pangolin-client
 Terminal=false

@@ -28,6 +28,7 @@ func setAlwaysOn(enabled bool) {
 	if !changed {
 		return
 	}
+	persistAlwaysOn(enabled)
 	if err := managers.IPCClientSetAlwaysOn(enabled); err != nil {
 		logger.Error("Failed to tell the manager Always-On is %v: %v", enabled, err)
 	}
@@ -53,6 +54,14 @@ func handleAlwaysOnStopped() {
 func reconnectAlwaysOn() {
 	if tunnelManager == nil {
 		return
+	}
+	// The daemon may be restarting (an upgrade, a crash): the tunnel went down
+	// with it. Wait for the UI to reattach instead of failing and giving up.
+	if !managers.IPCClientReady() {
+		logger.Info("Always-On: waiting for the manager service before reconnecting")
+		if !waitForIPC(alwaysOnEnabled) {
+			return
+		}
 	}
 	logger.Info("Always-On: reconnecting after the tunnel dropped")
 	if err := tunnelManager.Connect(); err != nil {
