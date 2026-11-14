@@ -51,6 +51,32 @@ func waitForServiceRunning(service *mgr.Service, timeout time.Duration) bool {
 	return false
 }
 
+// openManagerServiceForStart opens the SCM and the manager service with only
+// the rights needed to query and start it. mgr.Connect and mgr.OpenService ask
+// for full access, which standard users don't have. If starting is not allowed
+// either, the service is opened for querying only and Start fails with access
+// denied, which the caller handles with an elevated "net start".
+func openManagerServiceForStart(serviceName string) (*mgr.Mgr, *mgr.Service, error) {
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return nil, nil, err
+	}
+	name16, err := windows.UTF16PtrFromString(serviceName)
+	if err != nil {
+		windows.CloseServiceHandle(scm)
+		return nil, nil, err
+	}
+	h, err := windows.OpenService(scm, name16, windows.SERVICE_QUERY_STATUS|windows.SERVICE_START)
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		h, err = windows.OpenService(scm, name16, windows.SERVICE_QUERY_STATUS)
+	}
+	if err != nil {
+		windows.CloseServiceHandle(scm)
+		return nil, nil, err
+	}
+	return &mgr.Mgr{Handle: scm}, &mgr.Service{Name: serviceName, Handle: h}, nil
+}
+
 func execElevatedManagerServiceInstaller() error {
 	path, err := os.Executable()
 	if err != nil {
@@ -152,32 +178,25 @@ func main() {
 			return
 		}
 
-		// Pipe connect failed (manager not running or not installed). Use SCM to install/start; may require UAC.
+		// Pipe connect failed (manager not running or not installed). Look the
+		// service up with read-only SCM access, which standard users have, so
+		// an existing (MSI-installed) service is only ever started, never
+		// deleted and re-created by the elevated installer. Only a missing
+		// service goes through /installmanagerservice (UAC).
 		serviceName := config.AppName + "Manager"
-		m, err := mgr.Connect()
+		m, service, err := openManagerServiceForStart(serviceName)
 		if err != nil {
-			if err == windows.ERROR_ACCESS_DENIED {
-				logger.Info("Cannot access service manager without admin privileges")
-				logger.Info("Attempting to install/start manager service (will show UAC prompt)...")
+			if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+				logger.Info("Manager service not found, installing...")
 				err = execElevatedManagerServiceInstaller()
 				if err != nil {
-					logger.Fatal("Failed to install/start manager service: %v\nPlease run as administrator to install the service.", err)
+					logger.Fatal("Failed to install manager service: %v", err)
 				}
 				return
 			}
-			logger.Fatal("Failed to connect to service manager: %v", err)
+			logger.Fatal("Failed to open manager service: %v", err)
 		}
 		defer m.Disconnect()
-
-		service, err := m.OpenService(serviceName)
-		if err != nil {
-			logger.Info("Manager service not found, installing...")
-			err = execElevatedManagerServiceInstaller()
-			if err != nil {
-				logger.Fatal("Failed to install manager service: %v", err)
-			}
-			return
-		}
 		defer service.Close()
 
 		status, err := service.Query()

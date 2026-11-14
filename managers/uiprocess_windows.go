@@ -3,7 +3,7 @@ package managers
 import (
 	"errors"
 	"runtime"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -11,7 +11,11 @@ import (
 )
 
 type uiProcess struct {
-	handle uintptr
+	// mu makes closing the handle and using it in Kill mutually exclusive, so
+	// Kill never calls TerminateProcess on a handle value Wait has already
+	// closed (and the service may have reused for another process).
+	mu     sync.Mutex
+	handle windows.Handle
 }
 
 func launchUIProcess(executable string, args []string, workingDirectory string, handles []windows.Handle, token windows.Token) (*uiProcess, error) {
@@ -52,16 +56,19 @@ func launchUIProcess(executable string, args []string, workingDirectory string, 
 		return nil, err
 	}
 	windows.CloseHandle(pi.Thread)
-	uiProc := &uiProcess{handle: uintptr(pi.Process)}
+	uiProc := &uiProcess{handle: pi.Process}
 	runtime.SetFinalizer(uiProc, (*uiProcess).release)
 	return uiProc, nil
 }
 
 func (p *uiProcess) release() error {
-	handle := windows.Handle(atomic.SwapUintptr(&p.handle, uintptr(windows.InvalidHandle)))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	handle := p.handle
 	if handle == windows.InvalidHandle {
 		return nil
 	}
+	p.handle = windows.InvalidHandle
 	err := windows.CloseHandle(handle)
 	if err != nil {
 		return err
@@ -71,7 +78,11 @@ func (p *uiProcess) release() error {
 }
 
 func (p *uiProcess) Wait() (uint32, error) {
-	handle := windows.Handle(atomic.LoadUintptr(&p.handle))
+	// Only release, called below or by the finalizer once p is unreachable,
+	// closes the handle, so it stays valid while this waits without p.mu.
+	p.mu.Lock()
+	handle := p.handle
+	p.mu.Unlock()
 	s, err := windows.WaitForSingleObject(handle, syscall.INFINITE)
 	switch s {
 	case windows.WAIT_OBJECT_0:
@@ -90,10 +101,10 @@ func (p *uiProcess) Wait() (uint32, error) {
 }
 
 func (p *uiProcess) Kill() error {
-	handle := windows.Handle(atomic.LoadUintptr(&p.handle))
-	if handle == windows.InvalidHandle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.handle == windows.InvalidHandle {
 		return nil
 	}
-	return windows.TerminateProcess(handle, 1)
+	return windows.TerminateProcess(p.handle, 1)
 }
-
