@@ -111,8 +111,11 @@ func deleteAccount(userID string) {
 		setConnectionError("")
 		setLoggingOut(true)
 		defer setLoggingOut(false)
+		// Removing the active account switches to the next one, whose org
+		// settings the settings window must show.
+		defer emitPreferencesSettings()
 		logger.Info("Stopping tunnel before removing the active account")
-		if err := managers.IPCClientStopTunnel(); managers.IsIPCNotConnected(err) {
+		if err := stopTunnelForAccountChange(); managers.IsIPCNotConnected(err) {
 			// Without a manager connection this UI started no tunnel.
 			logger.Warn("Not connected to the manager; removing the account without stopping a tunnel")
 		} else if err != nil {

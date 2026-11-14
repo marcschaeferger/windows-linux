@@ -163,8 +163,36 @@ func refreshExitNodes() {
 			exitNodeMu.Unlock()
 		}
 		refreshOLMGateway()
+		enforceLockedExitNode(orgID)
 		publish()
 	}()
+}
+
+// enforceLockedExitNode routes traffic through the exit node the org's server
+// forces when olm reports it isn't, for example because the tunnel connected
+// while the exit node couldn't be looked up.
+func enforceLockedExitNode(orgID string) {
+	locked := cachedServerSettings(orgID).LockedExitNode()
+	if locked == 0 || tunnelManager == nil || tunnelManager.State() != tunnel.StateRunning {
+		return
+	}
+	exitNodeMu.Lock()
+	confirmed, active := hasOLMGatewayStatus, olmGatewayResourceID
+	exitNodeMu.Unlock()
+	if !confirmed || active == locked {
+		return
+	}
+	gateway, ok := findExitNode(orgID, locked)
+	if !ok {
+		logger.Warn("The exit node your organization requires is not available")
+		return
+	}
+	logger.Info("Applying the exit node your organization requires (%s)", gateway.Name)
+	if err := tunnelManager.SelectGateway(gateway.SiteResourceID, gateway.SiteIDs); err != nil {
+		logger.Error("Failed to apply the exit node your organization requires: %v", err)
+		return
+	}
+	setOLMGatewayStatus(true, gateway.SiteResourceID)
 }
 
 // onTunnelStateForExitNodes keeps exit node state in step with the tunnel.
@@ -173,6 +201,7 @@ func onTunnelStateForExitNodes(state tunnel.State) {
 	case tunnel.StateRunning:
 		// Connecting applies the saved exit node, so pick up the result.
 		refreshExitNodes()
+		go reconcileTunnelOrg()
 	case tunnel.StateStopped:
 		resetOLMGatewayStatus()
 	}
@@ -275,20 +304,30 @@ func disableExitNode() {
 // resolveSavedExitNode turns the saved exit node into the resource and site IDs
 // to establish when connecting, or 0/nil to connect without one. Only the
 // resource ID is saved (per account and org), so a deleted, disabled or
-// site-less resource is skipped.
-func resolveSavedExitNode(orgID string) (int, []int) {
+// site-less resource is skipped. An exit node the org's server forces is
+// never skipped because it couldn't be looked up: the last known one is used,
+// or an error says the tunnel must not connect.
+func resolveSavedExitNode(orgID string) (int, []int, error) {
 	if accountManager == nil || apiClient == nil {
-		return 0, nil
+		return 0, nil, nil
 	}
 	resourceID := effectiveExitNode(orgID)
 	if resourceID == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 
 	gateways, err := apiClient.ListGatewayResources(orgID)
 	if err != nil {
-		logger.Warn("Could not look up saved exit node (%v); connecting without it", err)
-		return 0, nil
+		if cachedServerSettings(orgID).LockedExitNode() == 0 {
+			logger.Warn("Could not look up saved exit node (%v); connecting without it", err)
+			return 0, nil, nil
+		}
+		if g, ok := findExitNode(orgID, resourceID); ok {
+			logger.Warn("Could not look up the exit node your organization requires (%v); using the last known one", err)
+			return g.SiteResourceID, g.SiteIDs, nil
+		}
+		logger.Error("Could not look up the exit node your organization requires: %v", err)
+		return 0, nil, fmt.Errorf("Your organization requires an exit node, but it could not be looked up (%v). Please try again.", err)
 	}
 	for _, g := range gateways {
 		if g.SiteResourceID != resourceID {
@@ -296,19 +335,49 @@ func resolveSavedExitNode(orgID string) (int, []int) {
 		}
 		if !g.Enabled || len(g.SiteIDs) == 0 {
 			logger.Warn("Saved exit node '%s' is disabled or has no sites; not using it", g.NiceID)
-			return 0, nil
+			return 0, nil, nil
 		}
-		return g.SiteResourceID, g.SiteIDs
+		return g.SiteResourceID, g.SiteIDs, nil
 	}
 	logger.Warn("Saved exit node no longer exists; not using it")
-	return 0, nil
+	return 0, nil, nil
+}
+
+// reconcileTunnelOrg moves the tunnel to the selected org if olm runs with
+// another one. An org switch can only be passed to olm while the tunnel is
+// up, so a switch that lands while it is connecting or dropped out (or a
+// connect that read the org just before the switch) is caught up here once
+// the tunnel is up again.
+func reconcileTunnelOrg() {
+	if tunnelManager == nil || authManager == nil {
+		return
+	}
+	org := authManager.CurrentOrg()
+	if org == nil {
+		return
+	}
+	status, err := tunnelManager.GetOLMStatus()
+	if err != nil || status.OrgID == "" || status.OrgID == org.Id {
+		return
+	}
+	logger.Info("Tunnel runs with organization %s, but %s is selected; switching it", status.OrgID, org.Id)
+	if err := tunnelManager.SwitchOLMOrg(org.Id); err != nil {
+		logger.Error("Failed to switch tunnel organization: %v", err)
+		return
+	}
+	syncExitNodeAfterOrgSwitch(org.Id)
 }
 
 func syncExitNodeAfterOrgSwitch(orgID string) {
 	go func() {
 		fetchServerSettings(orgID)
+		// The new org's server may manage other settings than the old one's.
+		emitPreferencesSettings()
 		if tunnelManager != nil && tunnelManager.State() == tunnel.StateRunning {
-			if resourceID, siteIDs := resolveSavedExitNode(orgID); resourceID != 0 {
+			if resourceID, siteIDs, err := resolveSavedExitNode(orgID); err != nil {
+				// Leave olm's current routing alone rather than dropping it.
+				logger.Error("Failed to apply the exit node after org switch: %v", err)
+			} else if resourceID != 0 {
 				if err := tunnelManager.SelectGateway(resourceID, siteIDs); err != nil {
 					logger.Error("Failed to apply saved exit node after org switch: %v", err)
 				} else {

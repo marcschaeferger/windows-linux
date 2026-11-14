@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fosrl/newt/logger"
@@ -44,6 +45,9 @@ var (
 	// Progress shown in the menu while it stays open, as on macOS.
 	pendingTunnelOn    *bool
 	pendingTunnelTimer *time.Timer
+	// pendingTunnelGen tells a timeout that has already fired whether its click
+	// is still the pending one.
+	pendingTunnelGen   uint64
 	connectionError    string
 	switchingAccountID string
 	switchingOrgID     string
@@ -84,13 +88,24 @@ const pendingTunnelTimeout = 30 * time.Second
 func setPendingTunnel(on *bool) {
 	stateMu.Lock()
 	pendingTunnelOn = on
+	pendingTunnelGen++
 	if pendingTunnelTimer != nil {
 		pendingTunnelTimer.Stop()
 		pendingTunnelTimer = nil
 	}
 	if on != nil {
+		gen := pendingTunnelGen
 		pendingTunnelTimer = time.AfterFunc(pendingTunnelTimeout, func() {
-			setPendingTunnel(nil)
+			// Stop can't cancel a timeout that already fired, so a newer
+			// click may have replaced this one meanwhile.
+			stateMu.Lock()
+			if pendingTunnelGen != gen {
+				stateMu.Unlock()
+				return
+			}
+			pendingTunnelOn = nil
+			pendingTunnelTimer = nil
+			stateMu.Unlock()
 			publish()
 		})
 	}
@@ -203,6 +218,7 @@ func collectMenuInputs() menuInputs {
 	stateMu.RUnlock()
 
 	rawPhase := phaseForState(currentTunnelState())
+	in.RawTunnelPhase = rawPhase
 	// Drops the user asked for show right away.
 	in.TunnelPhase = displayedTunnelPhase(rawPhase, in.PendingTunnelOn != nil || in.switching())
 	if tunnelManager != nil {
@@ -278,16 +294,51 @@ func currentMenuState() MenuState {
 	return buildMenuState(collectMenuInputs())
 }
 
-// publish pushes a fresh menu snapshot to the tray popup.
+var (
+	// publishSeq numbers publish calls in the order they start.
+	publishSeq atomic.Uint64
+	// publishMu orders the emits; lastPublished is the newest snapshot sent.
+	publishMu     sync.Mutex
+	lastPublished uint64
+)
+
+// publish pushes a fresh menu snapshot to the tray popup. It is called from
+// many goroutines, so a snapshot built earlier could otherwise be sent after a
+// newer one and leave the popup showing old state. Every state change is
+// followed by a publish, so dropping a snapshot that a later publish has
+// already overtaken never loses the latest state.
 func publish() {
 	if app == nil {
 		return
 	}
-	app.Event.Emit(eventMenuState, currentMenuState())
+	seq := publishSeq.Add(1)
+	menu := currentMenuState()
+	var accounts *AccountsView
 	// Keep Preferences > Accounts in step with the tray.
 	if prefsVisible.Load() {
-		app.Event.Emit(eventAccountsState, currentAccountsView())
+		view := currentAccountsView()
+		accounts = &view
 	}
+
+	emitIfNewest(seq, func() {
+		app.Event.Emit(eventMenuState, menu)
+		if accounts != nil {
+			app.Event.Emit(eventAccountsState, *accounts)
+		}
+	})
+}
+
+// emitIfNewest runs emit for the snapshot of publish call seq, unless a
+// snapshot of a later call was emitted already. It reports whether it ran.
+func emitIfNewest(seq uint64, emit func()) bool {
+	publishMu.Lock()
+	defer publishMu.Unlock()
+	if seq < lastPublished {
+		return false
+	}
+	lastPublished = seq
+	emit()
+	return true
 }
 
 // handleMenuOpen verifies the session and refreshes organizations when the tray popup opens.

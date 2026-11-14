@@ -26,10 +26,11 @@ export function Refresh(): $CancellablePromise<$models.Settings> {
 }
 
 /**
- * ResetOrg makes the current org use the global settings again.
+ * ResetOrg makes the current org use the global settings again. orgID is the
+ * org the Preferences tab shows; nothing is reset if it is no longer current.
  */
-export function ResetOrg(): $CancellablePromise<$models.Settings> {
-    return $Call.ByID(3873980668);
+export function ResetOrg(orgID: string): $CancellablePromise<$models.Settings> {
+    return $Call.ByID(3873980668, orgID);
 }
 
 /**

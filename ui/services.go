@@ -44,8 +44,9 @@ func (PreferencesService) Update(form Settings, scope string) SettingsResult {
 	return applySettings(form, scope)
 }
 
-// ResetOrg makes the current org use the global settings again.
-func (PreferencesService) ResetOrg() Settings { return resetOrgSettings() }
+// ResetOrg makes the current org use the global settings again. orgID is the
+// org the Preferences tab shows; nothing is reset if it is no longer current.
+func (PreferencesService) ResetOrg(orgID string) Settings { return resetOrgSettings(orgID) }
 
 // Refresh re-fetches the server's settings and returns the settings to show.
 func (PreferencesService) Refresh() Settings { return refreshPreferencesServerSettings() }

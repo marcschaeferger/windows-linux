@@ -156,20 +156,21 @@ func switchAccount(userID string) {
 	if active, _ := accountManager.ActiveAccount(); active != nil && active.UserID == userID {
 		return
 	}
-	stateMu.RLock()
-	busy := switchingAccountID != "" || switchingOrgID != "" || loggingOut || removingAccountID != ""
-	stateMu.RUnlock()
-	if busy {
+	// Test and set in one step, so a tray click and the Accounts tab can't
+	// both start a switch.
+	if !beginSwitch(&switchingAccountID, userID) {
 		return
 	}
 	// A connection error belongs to the account it happened on.
 	setConnectionError("")
-	setSwitchingAccount(userID)
+	publish()
 	defer setSwitchingAccount("")
+	// The settings window shows the active account's org settings.
+	defer emitPreferencesSettings()
 
 	// Switching users requires the tunnel to go down.
 	logger.Info("Stopping tunnel before switching accounts")
-	if err := managers.IPCClientStopTunnel(); err != nil {
+	if err := stopTunnelForAccountChange(); err != nil {
 		logger.Error("Failed to shut down tunnel before switch: %v", err)
 		showError(nil, "Tunnel Shutdown Failed", fmt.Sprintf("Failed to shut down tunnel before switching accounts: %v", err))
 		publish()
@@ -193,15 +194,22 @@ func selectOrganization(orgID string) {
 	if org := authManager.CurrentOrg(); org != nil && org.Id == orgID {
 		return
 	}
-	stateMu.RLock()
-	busy := switchingAccountID != "" || switchingOrgID != "" || loggingOut || removingAccountID != ""
-	stateMu.RUnlock()
-	if busy {
+	// The tunnel can only follow an org switch while it is up (or down). While
+	// it is connecting or dropped out, olm would keep the old org; the menu
+	// disables the orgs then, but a click can come from an older snapshot.
+	if tunnelManager != nil && phaseForState(tunnelManager.State()).transitional() {
+		logger.Info("Not switching organization while the tunnel is connecting or disconnecting")
+		publish()
+		return
+	}
+	if !beginSwitch(&switchingOrgID, orgID) {
 		return
 	}
 	setConnectionError("")
-	setSwitchingOrg(orgID)
+	publish()
 	defer setSwitchingOrg("")
+	// The settings window shows the current org's settings.
+	defer emitPreferencesSettings()
 	var found bool
 	for _, org := range authManager.Organizations() {
 		if org.Id != orgID {
@@ -241,6 +249,32 @@ func logout() {
 	if active := accountManager.ActiveUserID(); active != "" {
 		deleteAccount(active)
 	}
+}
+
+// beginSwitch marks an account or org switch as running by setting *flag to
+// id, unless a switch, logout or account removal is already running. The
+// check and the change happen under one lock.
+func beginSwitch(flag *string, id string) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if switchingAccountID != "" || switchingOrgID != "" || loggingOut || removingAccountID != "" {
+		return false
+	}
+	*flag = id
+	return true
+}
+
+// stopTunnelForAccountChange stops the tunnel before the active account
+// changes (switch, log out, log in). It goes through the tunnel manager so its
+// state and status polling follow, and it turns Always-On off: Always-On
+// belongs to the connection the user made, so a later UI start must not
+// reconnect it under another account.
+func stopTunnelForAccountChange() error {
+	setAlwaysOn(false)
+	if tunnelManager == nil {
+		return managers.IPCClientStopTunnel()
+	}
+	return tunnelManager.StopForAccountChange()
 }
 
 // quit stops any active tunnels and exits the UI process. The manager service keeps running.

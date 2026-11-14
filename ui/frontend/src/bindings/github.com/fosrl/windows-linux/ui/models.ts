@@ -250,6 +250,13 @@ export interface Settings {
     "disabled": boolean;
 
     /**
+     * OrgID is the org the form was filled in for, empty if there is none. A
+     * save for another org than the current one is refused, because the form
+     * shows that org's values.
+     */
+    "orgId": string;
+
+    /**
      * OrgName is the current org, empty if there is none.
      */
     "orgName": string;

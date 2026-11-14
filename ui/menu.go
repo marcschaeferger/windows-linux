@@ -151,6 +151,9 @@ type menuInputs struct {
 
 	// TunnelPhase is the phase to show; drops are debounced before they reach it.
 	TunnelPhase tunnelPhase
+	// RawTunnelPhase is the phase without debouncing. A drop that is held back
+	// still blocks org switching, which olm couldn't follow while reconnecting.
+	RawTunnelPhase tunnelPhase
 	Connected   bool
 	// PendingTunnelOn is set from a click on the connect switch until the
 	// tunnel reaches the requested state.
@@ -517,7 +520,7 @@ func orgSubmenu(in menuInputs) MenuItem {
 	}
 	for _, o := range in.Orgs {
 		it := checkItem(menuPrefixOrg+o.ID, o.Name,
-			!in.TunnelPhase.transitional() && !in.switching(),
+			!in.TunnelPhase.transitional() && !in.RawTunnelPhase.transitional() && !in.switching(),
 			in.CurrentOrgID != "" && o.ID == in.CurrentOrgID)
 		it.Loading = o.ID == in.SwitchingOrgID
 		sub = append(sub, it)

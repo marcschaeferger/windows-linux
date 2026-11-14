@@ -174,10 +174,8 @@ func TestNotificationsKeepOrderAndRouting(t *testing.T) {
 	}
 	defer other.Close()
 
-	svc := &ManagerService{events: w, eventQueue: make(chan []byte, eventQueueSize)}
-	bystander := &ManagerService{events: otherW, eventQueue: make(chan []byte, eventQueueSize)}
-	go svc.writeEvents()
-	go bystander.writeEvents()
+	svc := &ManagerService{events: w}
+	bystander := &ManagerService{events: otherW}
 	managerServicesLock.Lock()
 	managerServices[svc], managerServices[bystander] = true, true
 	managerServicesLock.Unlock()
@@ -185,9 +183,9 @@ func TestNotificationsKeepOrderAndRouting(t *testing.T) {
 		managerServicesLock.Lock()
 		delete(managerServices, svc)
 		delete(managerServices, bystander)
-		svc.closeEventQueue()
-		bystander.closeEventQueue()
 		managerServicesLock.Unlock()
+		svc.stopEvents()
+		bystander.stopEvents()
 		w.Close()
 		otherW.Close()
 	})
@@ -234,9 +232,19 @@ func TestNotificationsKeepOrderAndRouting(t *testing.T) {
 	}
 }
 
-func TestEnqueueWithoutQueueDoesNotPanic(t *testing.T) {
-	svc := &ManagerService{} // no queue, as in a service that was never served
-	svc.enqueueEvent([]byte("x"))
-	svc.closeEventQueue()
-	svc.closeEventQueue()
+func TestQueueEventIsBounded(t *testing.T) {
+	svc := &ManagerService{} // no events pipe: the writer drops what it takes
+	svc.queue.mu.Lock()
+	svc.queue.running = true // keep the writer from draining the queue
+	svc.queue.mu.Unlock()
+	for i := 0; i < eventQueueSize+10; i++ {
+		svc.queueEvent([]byte("x"))
+	}
+	svc.queue.mu.Lock()
+	n := len(svc.queue.pending)
+	svc.queue.mu.Unlock()
+	svc.stopEvents()
+	if n != eventQueueSize {
+		t.Fatalf("queue holds %d events, want at most %d", n, eventQueueSize)
+	}
 }

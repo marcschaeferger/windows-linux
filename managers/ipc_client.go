@@ -25,6 +25,9 @@ const (
 	UpdateProgressNotificationType
 	TunnelStateChangeNotificationType
 	UIActionNotificationType
+	// AsyncResultNotificationType carries the result of a long request
+	// (see ipc_async.go): request ID, UpdateState, error string.
+	AsyncResultNotificationType
 )
 
 type MethodType int
@@ -54,6 +57,9 @@ const (
 	// MayAdoptTunnelMethodType asks whether the running tunnel is not
 	// another user's. Reply: bool.
 	MayAdoptTunnelMethodType
+	// The long requests, answered by an AsyncResultNotificationType event.
+	InstallCLIAsyncMethodType
+	CheckForUpdatesAsyncMethodType
 )
 
 var (
@@ -123,8 +129,11 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 	registerSecretsIPC()
 	registerDevicePostureIPC()
 	tunnel.SetAdoptCheck(IPCClientMayAdoptTunnel)
+	conn := asyncConnected()
 	go func() {
 		defer ipcConnectionLost(generation)
+		// No result of a long request can arrive once the events stop.
+		defer failAsyncWaiters(conn)
 		decoder := gob.NewDecoder(events)
 		for {
 			var notificationType NotificationType
@@ -196,6 +205,14 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 				for cb := range uiActionCallbacks {
 					cb.cb(action)
 				}
+			case AsyncResultNotificationType:
+				var id uint64
+				var state UpdateState
+				var errStr string
+				if decoder.Decode(&id) != nil || decoder.Decode(&state) != nil || decoder.Decode(&errStr) != nil {
+					continue
+				}
+				deliverAsyncResult(id, state, errStr)
 			}
 		}
 	}()
@@ -349,23 +366,10 @@ func IPCClientAutoDownloadUpdatesTurnedOn() error {
 	return rpcEncoder.Encode(AutoDownloadUpdatesTurnedOnMethodType)
 }
 
+// IPCClientCheckForUpdates asks the manager to check for an update now. Other
+// requests aren't held up while the check runs.
 func IPCClientCheckForUpdates() (updateState UpdateState, err error) {
-	rpcMutex.Lock()
-	defer rpcMutex.Unlock()
-	if rpcEncoder == nil {
-		return UpdateStateUnknown, errIPCNotConnected
-	}
-
-	err = rpcEncoder.Encode(CheckForUpdatesMethodType)
-	if err != nil {
-		return
-	}
-	err = rpcDecoder.Decode(&updateState)
-	if err != nil {
-		return
-	}
-	err = rpcDecodeError()
-	return
+	return ipcClientCallAsync(CheckForUpdatesAsyncMethodType)
 }
 
 // IPCClientUpdate asks the manager to install the update. The manager
@@ -498,18 +502,11 @@ func IPCClientIsCLIInstalled() (installed bool, err error) {
 	return installed, nil
 }
 
+// IPCClientInstallCLI installs the Pangolin CLI through the manager. Other
+// requests aren't held up while it waits for authorization or the installer.
 func IPCClientInstallCLI() error {
-	rpcMutex.Lock()
-	defer rpcMutex.Unlock()
-	if rpcEncoder == nil {
-		return errIPCNotConnected
-	}
-
-	err := rpcEncoder.Encode(InstallCLIMethodType)
-	if err != nil {
-		return err
-	}
-	return rpcDecodeError()
+	_, err := ipcClientCallAsync(InstallCLIAsyncMethodType)
+	return err
 }
 
 func IPCClientRegisterTunnelStateChange(cb func(state TunnelState)) *TunnelStateChangeCallback {
@@ -709,9 +706,4 @@ func IPCClientReadLog(offset int64, max int) (LogChunk, error) {
 	}
 	err := rpcDecodeError()
 	return chunk, err
-}
-
-// IsIPCNotConnected reports whether err means the UI has no connection to the daemon.
-func IsIPCNotConnected(err error) bool {
-	return errors.Is(err, errIPCNotConnected)
 }

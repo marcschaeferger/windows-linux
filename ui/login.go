@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/fosrl/newt/logger"
-	"github.com/fosrl/windows-linux/managers"
 )
 
 const cloudHostname = "https://app.pangolin.net"
@@ -316,9 +315,11 @@ func performLogin(s *loginSession, ctx context.Context, hostname string) {
 	// Always stop any running tunnel after login. The login did switch the
 	// account, even if the sheet moved on meanwhile.
 	logger.Info("Stopping tunnel after successful login")
-	if err := managers.IPCClientStopTunnel(); err != nil {
+	if err := stopTunnelForAccountChange(); err != nil {
 		logger.Error("Failed to stop tunnel after login: %v", err)
 	}
+	// The new account's org settings replace the ones on screen.
+	emitPreferencesSettings()
 	withSession(s, func() {
 		if ctx.Err() != nil {
 			// A newer attempt owns the sheet now.

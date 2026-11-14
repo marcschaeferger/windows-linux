@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func newTestManager(t *testing.T) (*AccountManager, string) {
+func newTestAccountManager(t *testing.T) (*AccountManager, string) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
@@ -32,7 +32,7 @@ func corruptBackups(t *testing.T, path string) []string {
 // Covers #8/#21: readers race with every kind of writer; before the RWMutex
 // this was a concurrent map iteration/write (fatal error or -race report).
 func TestAccountManagerConcurrentReadWrite(t *testing.T) {
-	m, _ := newTestManager(t)
+	m, _ := newTestAccountManager(t)
 	for i := 0; i < 4; i++ {
 		if err := m.AddAccount(Account{UserID: fmt.Sprintf("u%d", i)}); err != nil {
 			t.Fatal(err)
@@ -83,7 +83,7 @@ func TestAccountManagerConcurrentReadWrite(t *testing.T) {
 
 // Covers #8/#21: returned copies must not alias the manager's OrgSettings map.
 func TestAccountCopiesDoNotAlias(t *testing.T) {
-	m, _ := newTestManager(t)
+	m, _ := newTestAccountManager(t)
 	if err := m.AddAccount(Account{UserID: "u"}); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestAccountCopiesDoNotAlias(t *testing.T) {
 }
 
 func TestAccountReadersEmptyAndMissing(t *testing.T) {
-	m, _ := newTestManager(t)
+	m, _ := newTestAccountManager(t)
 	if m.HasAccounts() || m.ActiveUserID() != "" || len(m.Accounts()) != 0 {
 		t.Error("expected empty manager")
 	}
@@ -139,7 +139,7 @@ func TestAccountReadersEmptyAndMissing(t *testing.T) {
 // Covers #51/#56: save/load round trip keeps OrgSettings and activeUserId, with
 // the same JSON keys as before, and accounts.json is 0600.
 func TestAccountsRoundTripAndFormat(t *testing.T) {
-	m, path := newTestManager(t)
+	m, path := newTestAccountManager(t)
 	if err := m.AddAccount(Account{UserID: "u1", Email: "a@b", OrgID: "o"}); err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestCorruptAccountsFile(t *testing.T) {
 
 // Covers #51/#56: a missing file creates an empty valid file.
 func TestMissingAccountsFileCreated(t *testing.T) {
-	m, path := newTestManager(t)
+	m, path := newTestAccountManager(t)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("file not created: %v", err)
@@ -269,7 +269,7 @@ func TestAccountsSaveFailureKeepsOldFile(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("needs permission enforcement")
 	}
-	m, path := newTestManager(t)
+	m, path := newTestAccountManager(t)
 	if err := m.AddAccount(Account{UserID: "u"}); err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestAccountsSaveFailureKeepsOldFile(t *testing.T) {
 func TestAccountSettersSkipUnchangedWrites(t *testing.T) {
 	const sentinel = "SENTINEL-NOT-JSON"
 	setup := func(t *testing.T) (*AccountManager, string) {
-		m, path := newTestManager(t)
+		m, path := newTestAccountManager(t)
 		if err := m.AddAccount(Account{UserID: "u", Username: "un", Name: "nm", OrgID: "o1"}); err != nil {
 			t.Fatal(err)
 		}

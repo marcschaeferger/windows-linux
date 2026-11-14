@@ -1,7 +1,6 @@
 package managers
 
 import (
-	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -41,13 +40,10 @@ var (
 )
 
 type ManagerService struct {
-	events    *os.File
-	eventLock sync.Mutex
-	// eventQueue holds encoded notifications for the one goroutine that writes
-	// them, so a UI receives them in the order they were sent.
-	eventQueue     chan []byte
-	eventQueueOnce sync.Once
-	elevatedToken  userToken
+	events        *os.File
+	eventLock     sync.Mutex
+	queue         eventQueue // delivers notifications to the UI in order
+	elevatedToken userToken
 	// clientUserKey identifies the connected user: a SID on Windows, a UID on Linux.
 	clientUserKey string
 	// session is the UI's Windows session ID, or its UID on Linux.
@@ -99,8 +95,8 @@ func (s *ManagerService) Quit(stopTunnelsOnQuit bool) (alreadyQuit bool, err err
 	s.events = nil
 	s.eventLock.Unlock()
 	delete(managerServices, s)
-	s.closeEventQueue()
 	managerServicesLock.Unlock()
+	s.stopEvents()
 
 	if stopTunnelsOnQuit {
 		// Stop all active tunnels before quitting
@@ -526,6 +522,15 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 			if err = encoder.Encode(errToString(retErr)); err != nil {
 				return
 			}
+		case InstallCLIAsyncMethodType, CheckForUpdatesAsyncMethodType:
+			var id uint64
+			if decoder.Decode(&id) != nil {
+				return
+			}
+			err = encoder.Encode(errToString(s.startAsync(methodType, id)))
+			if err != nil {
+				return
+			}
 		default:
 			logger.Error("IPC server: ServeConn unknown method type %d, closing connection", methodType)
 			return
@@ -551,12 +556,10 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 
 	service := &ManagerService{
 		events:        events,
-		eventQueue:    make(chan []byte, eventQueueSize),
 		elevatedToken: elevatedToken,
 		clientUserKey: clientUserKey,
 		session:       session,
 	}
-	go service.writeEvents()
 
 	done := make(chan struct{})
 	go func() {
@@ -570,91 +573,43 @@ func IPCServerListen(reader, writer, events *os.File, elevatedToken userToken, c
 		service.events = nil
 		service.eventLock.Unlock()
 		delete(managerServices, service)
-		service.closeEventQueue()
 		managerServicesLock.Unlock()
+		service.stopEvents()
 	}()
 	return done
 }
 
-func encodeNotification(notificationType NotificationType, ifaces ...any) (*bytes.Buffer, bool) {
-	var buf bytes.Buffer
-	encoder := gob.NewEncoder(&buf)
-	if err := encoder.Encode(notificationType); err != nil {
-		return nil, false
-	}
-	for _, iface := range ifaces {
-		if err := encoder.Encode(iface); err != nil {
-			return nil, false
-		}
-	}
-	return &buf, true
-}
-
 // notifyOne sends a notification to one UI, if it is still connected.
 func notifyOne(to *ManagerService, notificationType NotificationType, ifaces ...any) {
-	buf, ok := encodeNotification(notificationType, ifaces...)
-	if !ok {
+	event, err := encodeNotification(notificationType, ifaces...)
+	if err != nil {
 		return
 	}
 	managerServicesLock.RLock()
 	if managerServices[to] {
-		to.enqueueEvent(buf.Bytes())
+		to.queueEvent(event)
 	}
 	managerServicesLock.RUnlock()
 }
 
 func notifyAll(notificationType NotificationType, adminOnly bool, ifaces ...any) {
+	managerServicesLock.RLock()
+	defer managerServicesLock.RUnlock()
 	if len(managerServices) == 0 {
 		return
 	}
 
-	buf, ok := encodeNotification(notificationType, ifaces...)
-	if !ok {
+	event, err := encodeNotification(notificationType, ifaces...)
+	if err != nil {
 		return
 	}
 
-	managerServicesLock.RLock()
 	for m := range managerServices {
 		if m.elevatedToken == 0 && adminOnly {
 			continue
 		}
-		m.enqueueEvent(buf.Bytes())
-	}
-	managerServicesLock.RUnlock()
-}
-
-// eventQueueSize is how many notifications may wait for a UI that reads slowly.
-const eventQueueSize = 1024
-
-// enqueueEvent queues an encoded notification for the UI. It must be called
-// with managerServicesLock held, which closeEventQueue's callers also hold.
-func (s *ManagerService) enqueueEvent(msg []byte) {
-	select {
-	case s.eventQueue <- msg:
-	default:
-		logger.Warn("IPC: dropping a notification for %s: its event queue is full", s.clientUserKey)
-	}
-}
-
-// closeEventQueue ends writeEvents. Callers hold managerServicesLock for
-// writing, after removing s from managerServices.
-func (s *ManagerService) closeEventQueue() {
-	s.eventQueueOnce.Do(func() {
-		if s.eventQueue != nil {
-			close(s.eventQueue)
-		}
-	})
-}
-
-// writeEvents sends queued notifications to the UI one at a time and in order.
-func (s *ManagerService) writeEvents() {
-	for msg := range s.eventQueue {
-		s.eventLock.Lock()
-		if s.events != nil {
-			s.events.SetWriteDeadline(time.Now().Add(time.Second))
-			s.events.Write(msg)
-		}
-		s.eventLock.Unlock()
+		// In order, per UI (see eventQueue).
+		m.queueEvent(event)
 	}
 }
 

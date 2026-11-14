@@ -7,7 +7,7 @@ import (
 	"unsafe"
 )
 
-var procGetNamedPipeClientSessionId = modKernel32.NewProc("GetNamedPipeClientSessionId")
+// procGetNamedPipeClientSessionId is declared in cli_secrets_pipe_windows.go.
 
 // pipeClientSessionID returns the session of the process that opened the
 // client end of conn. The pipe file system records it when the pipe is
