@@ -124,7 +124,7 @@ type windowsSystemQueryResult struct {
 	AntivirusProductStates []uint32 `json:"antivirusProductStates"`
 }
 
-func gatherDevicePosture() (*Fingerprint, *PostureChecks) {
+func gatherDevicePosture() (*Fingerprint, *PostureChecks, bool) {
 	logger.Debug("Fingerprint: gatherDevicePosture() starting")
 
 	var username string
@@ -179,7 +179,7 @@ func gatherDevicePosture() (*Fingerprint, *PostureChecks) {
 
 	logger.Debug("Fingerprint: gatherDevicePosture() finished (hostname=%q, model=%q, hasSerial=%v, sysQueryOK=%v)",
 		fp.Hostname, fp.DeviceModel, fp.SerialNumber != "", sysQueryOK)
-	return fp, postures
+	return fp, postures, sysQueryOK
 }
 
 func postureChecksFromSystemQuery(query windowsSystemQueryResult, ok bool) *PostureChecks {
@@ -351,8 +351,9 @@ func resolveSerialNumber(sysQueryOK bool, wmiSerial string) string {
 		return regSerial
 	}
 
+	// A placeholder serial is reported as is, but never cached: it identifies
+	// nothing, and computePlatformFingerprint ignores it.
 	if sysQueryOK && wmiSerial != "" {
-		saveCachedSerial(wmiSerial)
 		return wmiSerial
 	}
 
@@ -457,6 +458,27 @@ func dmiFingerprint() string {
 	read("BaseBoardProduct", "board_name")
 
 	return strings.Join(parts, "|")
+}
+
+// osMachineID returns HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid, which
+// Windows creates at install time. The 64-bit view is read explicitly so a
+// 32-bit process sees the same value.
+func osMachineID() string {
+	k, err := registry.OpenKey(
+		registry.LOCAL_MACHINE,
+		`SOFTWARE\Microsoft\Cryptography`,
+		registry.QUERY_VALUE|registry.WOW64_64KEY,
+	)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+
+	guid, _, err := k.GetStringValue("MachineGuid")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(guid)
 }
 
 // serialCachePath is in the user data directory of the account gathering the
