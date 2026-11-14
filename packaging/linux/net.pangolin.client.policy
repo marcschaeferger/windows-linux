@@ -2,8 +2,9 @@
 <!DOCTYPE policyconfig PUBLIC
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
-<!-- Lets users outside the sudo and wheel groups install the Pangolin CLI
-     with an administrator's password. See managers/cli_installer_linux.go. -->
+<!-- Asked before root installs the Pangolin CLI, also for sudo and wheel
+     members (managers/cli_installer_linux.go), and decides who may bring
+     up the tunnel (managers/authz_linux.go). -->
 <policyconfig>
   <vendor>Fossorial, Inc.</vendor>
   <vendor_url>https://pangolin.net</vendor_url>
@@ -15,6 +16,18 @@
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+  <!-- Asked only for users without a session on a local seat (SSH-only
+       users, system accounts); users signed in at the computer connect
+       without it. The tunnel changes routes and DNS for the whole machine. -->
+  <action id="net.pangolin.client.connect">
+    <description>Connect this computer to a Pangolin network</description>
+    <message>Authentication is required to connect this computer to a Pangolin network</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
     </defaults>
   </action>
 </policyconfig>

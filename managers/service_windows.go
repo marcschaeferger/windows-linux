@@ -268,7 +268,7 @@ func (service *managerService) Execute(args []string, r <-chan svc.ChangeRequest
 					procsLock.Lock()
 					uiRunning := len(procs) > 0
 					procsLock.Unlock()
-					if !uiRunning {
+					if !uiRunning && !otherSessionsTunnelRunning(session) {
 						installStagedUpdate(session, false, launchAfterFailedInstall)
 					}
 				}
@@ -277,7 +277,7 @@ func (service *managerService) Execute(args []string, r <-chan svc.ChangeRequest
 			procsLock.Lock()
 			uiRunning := len(procs) > 0
 			procsLock.Unlock()
-			if !uiRunning && installStagedUpdate(session, true, launchAfterFailedInstall) {
+			if !uiRunning && !otherSessionsTunnelRunning(session) && installStagedUpdate(session, true, launchAfterFailedInstall) {
 				return
 			}
 			logger.Info("Always-On: restarting UI process for user '%s@%s' for session %d", username, domain, session)
@@ -289,7 +289,7 @@ func (service *managerService) Execute(args []string, r <-chan svc.ChangeRequest
 	// automatic downloads on, a staged update is installed first unless another
 	// session's UI is running, and the upgraded manager launches the UI instead.
 	goStartProcess := func(session uint32) {
-		if len(procs) == 0 && installStagedUpdate(session, true, launchAfterFailedInstall) {
+		if len(procs) == 0 && !otherSessionsTunnelRunning(session) && installStagedUpdate(session, true, launchAfterFailedInstall) {
 			return
 		}
 		procsGroup.Add(1)
@@ -310,6 +310,7 @@ func (service *managerService) Execute(args []string, r <-chan svc.ChangeRequest
 	}
 
 	loadStagedUpdate()
+	loadTunnelOwners()
 	go checkForUpdates()
 
 	// TODO: Add driver cleanup when driver package is implemented

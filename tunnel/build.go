@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/fosrl/newt/logger"
@@ -45,6 +46,11 @@ func (s *tunnelService) buildTunnel(config Config) error {
 		OnTerminated: func() {
 			logger.Info("Tunnel: OLM terminated")
 		},
+	}
+
+	// The API socket must not be reachable by other local users.
+	if err := prepareOLMSocket(); err != nil {
+		return fmt.Errorf("prepare OLM API socket: %w", err)
 	}
 
 	// Initialize OLM with context and GlobalConfig
