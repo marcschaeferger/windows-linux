@@ -102,7 +102,8 @@ sudo/wheel/admin, else 0). `notifyAll(..., adminOnly)` skips non-admins.
 Side channels outside the gob IPC:
 - Windows named pipes: `\\.\pipe\pangolin-manager-ui-launch` (u32 session →
   0 launching / 1 already running / 2 no session), `...-ui-action` (session,
-  action → 0/1), `...-cli-secrets` (CLI companion mode). All allow Everyone.
+  action → 0/1), `...-cli-secrets` (CLI companion mode). All allow Everyone;
+  launch and action requests must name the caller's own session.
 - Linux socket `/run/pangolin-client/manager.sock` (0666, SO_PEERCRED checks):
   first byte `U` attach, `A` UI action, `S` CLI secrets, `Q` update status.
   See [linux.md](linux.md).
@@ -122,6 +123,11 @@ Side channels outside the gob IPC:
 4. The tunnel process runs olm (`tunnel/build.go`), which serves its HTTP API
    on the OLM socket. The UI polls status over that socket
    (`StartStatusPolling`, `GetOLMStatus`), switches org, selects gateway.
+   On Linux the socket is in `/run/pangolin-client/olm/`, which root owns and
+   only the tunnel's owner may enter (POSIX ACL set by the daemon before each
+   start, `tunnel.GrantOLMSocketAccess`), so the owner's UI and CLI reach it
+   and other users don't. The Windows pipe still allows Everyone: olm sets
+   its DACL, and restricting it needs an olm option.
 5. Stop: IPC `StopTunnel` → `UninstallTunnel` (Linux: SIGTERM, 30s, then
    kill; olm restores DNS and routes on SIGTERM).
 
@@ -132,11 +138,40 @@ IPC `StopAllTunnels`, then exits; it does **not** use the IPC `Quit` method
 (legacy, see windows.md). If the UI goes away any other way (crash, killed,
 update restart), the tunnel keeps running in the manager and the next UI
 adopts it (`adoptRunningTunnel`, commit `5ea5fa9`). Signing out of the
-Pangolin account stops it. There is one tunnel name machine-wide, so on a
-multi-user Linux box only one user can be connected at a time, and
-`StopAllTunnels` stops it regardless of who started it. On Windows, a session logoff stops
-tunnels that session started (`stopSessionTunnels`); **Linux has no
-equivalent yet** (see [history.md](history.md#known-gaps)).
+Pangolin account stops it.
+
+There is one tunnel per computer (the manager pins the name to
+`tunnel.DefaultTunnelName`), owned by the user who started it
+(`activeTunnels`: user key, session, `managers/tunnel_owner.go`). While it
+runs, other users' `StartTunnel` is refused with "connected for another
+user", their `StopTunnel`/`StopAllTunnels` leave it alone, and state
+notifications go only to the owner's UIs. A UI adopts a running tunnel only
+if the manager says it isn't another user's (`MayAdoptTunnelMethodType`,
+checked in `AdoptRunningTunnel`); on Linux other users can't reach its OLM
+socket either. A tunnel
+whose process is gone has no owner. On Windows the owner is also stored in
+the tunnel service's registry key, so a tunnel that outlives a manager
+restart keeps it (on Linux tunnels stop with the daemon). Signing out stops
+the tunnels that session started (`stopSessionTunnels`): Windows on
+`WTS_SESSION_LOGOFF`, Linux from `watchTunnelOwners` (logind, every 5s).
+
+Authorization (`authorizeTunnelUse`, `authz_*.go`): Windows allows every UI
+the service started (interactive session users only). Linux allows root and
+users with a session on a local seat (active or switched away); anyone else
+(SSH-only users, system accounts, also sudo/wheel members) needs the polkit
+action `net.pangolin.client.connect` (`auth_admin_keep`). Without logind,
+regular accounts (UID_MIN and up) are allowed. It gates `StartTunnel` and
+`GetDevicePosture` (which carries root-only data such as the DMI serial).
+`Update` (`UpdateCheckedMethodType`, which replies with a refusal; the old
+`UpdateMethodType` is checked the same way and gets no reply) is checked
+before anything happens. When nobody else is affected (no other user's
+tunnel runs, nobody else signed in; Linux: has a UI attached), admins may,
+and so may anyone else (Linux: a staged update only). When others are
+affected, only an elevated admin token (Windows) or root (Linux) may. The
+manager then stops every tunnel itself, sending Stopping first, before the
+install starts. The staged installs at UI quit and launch also wait while
+another session's tunnel runs. `Quit` needs an elevated token on Windows and
+root on Linux.
 
 ## UI process
 

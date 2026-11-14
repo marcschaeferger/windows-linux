@@ -37,9 +37,10 @@ The service (`/managerservice`, `managers/service_windows.go`):
   [updates.md](updates.md)), then relaunches UIs recorded before an update,
   then handles sessions already signed in.
 - IPC `Quit` (inherited from wireguard-windows) sends on `quitManagersChan`,
-  which stops the service **and uninstalls it** (`UninstallManager`). Nothing
-  in the UI calls `IPCClientQuit` today; the tray Quit stops tunnels and exits
-  the UI only, and the service keeps running. On Linux nothing reads
+  which stops the service **and uninstalls it** (`UninstallManager`). It is
+  refused unless the client has an elevated token. Nothing in the UI calls
+  `IPCClientQuit` today; the tray Quit stops that user's tunnels and exits the
+  UI only, and the service keeps running. On Linux nothing reads
   `quitManagersChan` at all. Don't wire up IPC Quit without knowing this.
 
 ## Windows-only pieces
@@ -48,7 +49,7 @@ The service (`/managerservice`, `managers/service_windows.go`):
 | --- | --- | --- |
 | Service install/uninstall, tunnel services | `managers/install_windows.go` | Tunnel service name `PangolinTunnel$<name>`; Wintun driver DLL shipped in MSI |
 | UI process creation | `managers/uiprocess_windows.go` | env block from token, inherited handles via `EXTENDED_STARTUPINFO_PRESENT` |
-| Named pipes | `managers/ui_launcher_windows.go`, `managers/cli_secrets_pipe_windows.go` | SDDL `D:(A;;GA;;;WD)` (Everyone); CLI secrets identifies caller by client PID → token SID |
+| Named pipes | `managers/ui_launcher_windows.go`, `managers/cli_secrets_pipe_windows.go` | SDDL `D:(A;;GA;;;WD)` (Everyone). UI-launch and UI-action requests must name the caller's own session (`GetNamedPipeClientSessionId`, `managers/pipeclient_windows.go`); CLI secrets identifies caller by client PID → token SID |
 | Admin token | `managers/token_windows.go` | `userToken = windows.Token` |
 | Secrets | `managers/secretstore/dpapi_windows.go`, `filestore_windows.go` | DPAPI as SYSTEM; dir/file SDDL SYSTEM+Admins only |
 | Credential Manager migration | `secrets/migrate_windows.go` | moves old Credential Manager entries into the service store |

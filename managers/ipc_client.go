@@ -46,6 +46,12 @@ const (
 	AlwaysOnEnabledMethodType
 	UpdateVersionMethodType
 	AutoDownloadUpdatesTurnedOnMethodType
+	// UpdateCheckedMethodType is Update with an error reply (a refusal).
+	// UpdateMethodType stays for older UIs and gets no reply.
+	UpdateCheckedMethodType
+	// MayAdoptTunnelMethodType asks whether the running tunnel is not
+	// another user's. Reply: bool.
+	MayAdoptTunnelMethodType
 )
 
 var (
@@ -89,6 +95,7 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 	rpcEncoder = gob.NewEncoder(writer)
 	registerSecretsIPC()
 	registerDevicePostureIPC()
+	tunnel.SetAdoptCheck(IPCClientMayAdoptTunnel)
 	go func() {
 		decoder := gob.NewDecoder(events)
 		for {
@@ -270,15 +277,38 @@ func IPCClientCheckForUpdates() (updateState UpdateState, err error) {
 	return
 }
 
+// IPCClientUpdate asks the manager to install the update. The manager
+// refuses users who may not install updates (the error is returned) and
+// otherwise stops the tunnels itself before the install starts.
 func IPCClientUpdate() error {
-	// Always stop any running tunnel services first
-	// Ignore errors from StopTunnel as it's safe to call even if no tunnel is running
-	_ = IPCClientStopTunnel()
-
 	rpcMutex.Lock()
 	defer rpcMutex.Unlock()
+	if rpcEncoder == nil {
+		return errIPCNotConnected
+	}
+	if err := rpcEncoder.Encode(UpdateCheckedMethodType); err != nil {
+		return err
+	}
+	return rpcDecodeError()
+}
 
-	return rpcEncoder.Encode(UpdateMethodType)
+// IPCClientMayAdoptTunnel reports whether the UI may adopt the running
+// tunnel: false when another user on the computer started it. Without an
+// answer from the manager it says yes, as before.
+func IPCClientMayAdoptTunnel() bool {
+	rpcMutex.Lock()
+	defer rpcMutex.Unlock()
+	if rpcEncoder == nil {
+		return true
+	}
+	if err := rpcEncoder.Encode(MayAdoptTunnelMethodType); err != nil {
+		return true
+	}
+	var mayAdopt bool
+	if err := rpcDecoder.Decode(&mayAdopt); err != nil {
+		return true
+	}
+	return mayAdopt
 }
 
 func IPCClientRegisterManagerStopping(cb func()) *ManagerStoppingCallback {

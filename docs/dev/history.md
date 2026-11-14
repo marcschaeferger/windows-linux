@@ -78,7 +78,6 @@ leave changes staged or uncommitted unless asked.
 
 ## Known gaps
 
-- Linux doesn't stop a user's tunnel when they log out (Windows does).
 - `services.StartedAtBoot()` is always false on Linux (no boot jitter).
 - `xdg-utils` not declared as a dependency; `openURL` has no `gio`/`exo-open`
   fallback, so "open in browser" can silently fail on minimal installs.
