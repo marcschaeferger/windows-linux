@@ -31,6 +31,10 @@ func (s *tunnelService) buildTunnel(config Config) error {
 	// Create context for OLM
 	olmContext := context.Background()
 
+	// olm starts the DNS watchdog when it overrides the system DNS, so a
+	// killed tunnel process does not leave the DNS pointed at a dead proxy.
+	watchdogExe, watchdogSubcommand := watchdogSettings()
+
 	// Create OLM GlobalConfig with values derived from system config
 	olmInitConfig := olmpkg.OlmConfig{
 		LogLevel:   configpkg.GetSystemLogLevel(),
@@ -39,6 +43,9 @@ func (s *tunnelService) buildTunnel(config Config) error {
 		Version:    version.Number,
 		Agent:      "Pangolin " + version.OSDisplayName,
 		OlmVersion: version.OlmVersionOverride,
+
+		WatchdogExecutable: watchdogExe,
+		WatchdogSubcommand: watchdogSubcommand,
 		OnConnected: func() {
 			logger.Info("Tunnel: OLM connected")
 		},

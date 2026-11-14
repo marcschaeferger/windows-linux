@@ -37,7 +37,10 @@ user session ── pangolin-client           (UI, GDK_BACKEND=x11, attaches to 
 (0755), removes a stale socket, listens, then: `loadStagedUpdate()`, tries to
 install a staged update before anything else (UIs that connect meanwhile get
 `attachUpdating`), relaunches UIs recorded before an update, and starts the
-update checker. On SIGTERM/SIGINT: refuse new attaches, notify UIs
+update checker. Before listening it starts olm's stale-DNS cleanup
+(`CleanupStaleState("Pangolin")`) in the background; a tunnel start waits for
+it. Tunnels run olm's DNS watchdog (`pangolin-client --dns-watchdog`) so a
+SIGKILLed tunnel process doesn't leave the system DNS on a dead proxy. On SIGTERM/SIGINT: refuse new attaches, notify UIs
 (ManagerStopping), stop all tunnel processes (parallel), exit. The systemd unit
 uses `KillMode=mixed` + `TimeoutStopSec=45` so only the daemon gets SIGTERM and
 can stop tunnels cleanly (restoring DNS/routes).
@@ -63,10 +66,37 @@ the start command for this system's init (`daemonUnavailableWarning`: systemd,
 OpenRC, or `sudo pangolin-client --daemon`). Sign-in can't persist without the
 daemon.
 
+### UI side: single instance and reconnecting
+
+The UI takes a per-user flock on `$XDG_RUNTIME_DIR/pangolin-client.lock`
+(`managers.AcquireUILock`) before attaching, so a second UI can't start even
+while the daemon is unreachable (the daemon's `attachedUIs` only knows UIs that
+attached). A second launch asks the first to show itself and exits.
+
+The UI outlives the daemon. When the daemon stops (package upgrade, crash,
+`systemctl restart`) the events pipe closes and `managers.ipcConnectionLost`
+runs; `ui/ipcreconnect_linux.go` then calls `AttachUI` with backoff (1s doubling
+to 30s) until it succeeds, re-sends Always-On, and shows nothing in between.
+A UI that started before the daemon does the same, and runs its start-up
+connect steps once attached (the "service isn't running" warning only appears
+after 20 s). If the UI's binary was replaced meanwhile
+(`/proc/self/exe` ends in " (deleted)", as after a dnf/apt upgrade), it
+re-executes itself first so the new version runs. Always-On is kept in a marker
+file, `$XDG_RUNTIME_DIR/pangolin-client.alwayson`, because a restarted daemon
+and a re-executed or relaunched UI all start without it; it ends with the
+session, as on Windows. If another UI attached first (three refusals in a row),
+or the binary was removed, the UI quits. Always-On's tunnel reconnect waits for
+the connection instead of failing. Windows still quits on
+ManagerStopping.
+
 ### UI detach handling
 
 When the UI's IPC connection closes (`IPCServerListen` returns `done`):
 1. Remove from `attachedUIs`.
+1a. `handleUIGone` (unless the daemon is stopping): wait 2s, then ask logind
+   (`userStillSignedIn`; without logind or systemd the user counts as signed
+   in, and if `loginctl` itself fails `/run/user/<uid>` decides). If the user signed out: clear Always-On (as Windows does at logoff) and
+   stop here, with no relaunch. Otherwise:
 2. `installStagedUpdateAfterQuit`: if a staged update exists, Always-On is off,
    the daemon isn't stopping, wait 2s, check `loginctl show-user <uid>
    --property=State` is `active`/`online` (so sign-out/crash-at-logout doesn't

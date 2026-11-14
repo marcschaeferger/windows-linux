@@ -77,8 +77,9 @@ install_files() {
     [ -f "$src/bin/$NAME" ] || die "run install.sh from the extracted archive (no bin/$NAME next to it)"
     init=$1
 
-    # Exec= is the full path so the menu entries work when PREFIX isn't in PATH.
-    exec_sed="s|^Exec=$NAME|Exec=$BIN|"
+    # Exec= and TryExec= are the full path so the menu entries work when PREFIX
+    # isn't in PATH.
+    exec_sed="s|^Exec=$NAME|Exec=$BIN|;s|^TryExec=$NAME|TryExec=$BIN|"
 
     install -Dm755 "$src/bin/$NAME" "$DESTDIR$BIN"
     install -d "$DESTDIR$APPLICATIONS" "$DESTDIR$(dirname "$AUTOSTART")"

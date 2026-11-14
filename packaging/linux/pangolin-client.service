@@ -1,8 +1,10 @@
 [Unit]
 Description=Pangolin client background service
 Documentation=https://docs.pangolin.net
-Wants=network-online.target
-After=network-online.target
+# The daemon only listens on its socket; olm handles connectivity. Waiting for
+# network-online.target delayed it by up to a minute where Wi-Fi comes up late,
+# so a UI started at login by autostart found no daemon.
+After=network.target
 
 [Service]
 Type=simple

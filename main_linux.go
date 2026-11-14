@@ -17,6 +17,7 @@ import (
 const usage = `Usage: pangolin-client [--autostart]
        pangolin-client --daemon
        pangolin-client --tunnel <config.json>
+       pangolin-client --dns-watchdog --parent-pid=<pid> [--interface=<name>] [--socket=<path>]
 `
 
 // daemonUnavailableWarning is shown when the UI can't reach the daemon, with
@@ -59,6 +60,14 @@ func main() {
 		}
 		return
 
+	case len(args) > 0 && args[0] == "--dns-watchdog":
+		// Started by the tunnel's olm while it overrides the system DNS: resets
+		// the DNS if the tunnel process dies without restoring it.
+		if err := runDNSWatchdog(args[1:]); err != nil {
+			logger.Fatal("DNS watchdog failed: %v", err)
+		}
+		return
+
 	case len(args) == 1 && args[0] == "--autostart":
 		// Run from the XDG autostart entry at sign-in: only open the UI if
 		// the user asked for it, as the Windows service does at logon.
@@ -70,6 +79,14 @@ func main() {
 	case len(args) > 0:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
+	}
+
+	// One UI per user, even before the daemon is reachable (the daemon only
+	// knows the UIs that attached to it).
+	if err := managers.AcquireUILock(); errors.Is(err, managers.ErrUIAlreadyRunning) {
+		logger.Info("Pangolin is already running; asking it to show itself")
+		managers.RequestUIAction(managers.UIActionShow)
+		return
 	}
 
 	var warning string
@@ -87,6 +104,7 @@ func main() {
 		}
 		return
 	case err != nil:
+		// The UI keeps trying to attach in the background.
 		logger.Error("Failed to connect to the Pangolin daemon: %v", err)
 		warning = daemonUnavailableWarning()
 	default:

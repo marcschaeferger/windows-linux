@@ -152,7 +152,13 @@ func onStarted() {
 	}()
 
 	if startupWarning != "" {
-		go showWarning(nil, config.AppName, startupWarning)
+		go func() {
+			// The daemon may only be a moment behind the UI at login.
+			if !startupWarningStillNeeded() {
+				return
+			}
+			showWarning(nil, config.AppName, startupWarning)
+		}()
 	}
 	updateTrayForState(currentTunnelState())
 	refreshCLIInstallState()
@@ -164,12 +170,23 @@ func onStarted() {
 	if onboardingNeeded() {
 		// Nothing connects until setup is finished.
 		go autoOpenOnboarding()
-	} else if managers.IPCClientAlwaysOn() {
+	} else if canStartConnectAtLaunch() {
+		startConnectAtLaunch()
+	}
+	// Started without the daemon (Linux): keep trying to attach to it.
+	reconnectIPCIfDown()
+	publish()
+}
+
+// startConnectAtLaunch resumes Always-On or connects at login, as set up. It
+// needs the manager connection. When the UI started before the daemon was
+// reachable it runs once the connection is made.
+func startConnectAtLaunch() {
+	if managers.IPCClientAlwaysOn() || alwaysOnPersisted() {
 		go resumeAlwaysOn(authManager)
 	} else if configManager != nil && configManager.GetAutoConnectAtLogin() {
 		go autoConnect(authManager)
 	}
-	publish()
 }
 
 // newtLogHandler forwards Wails' slog output to the shared Pangolin log.

@@ -95,3 +95,10 @@ func homeDir() string {
 func UserDataDirFor(home string) string {
 	return filepath.Join(home, ".config", linuxDirName)
 }
+
+// UserDataDirUnder is the app's directory inside a config home such as
+// $XDG_CONFIG_HOME, for the root daemon, which gets that path from the UI's
+// environment.
+func UserDataDirUnder(configHome string) string {
+	return filepath.Join(configHome, linuxDirName)
+}
