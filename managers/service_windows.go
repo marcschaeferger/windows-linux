@@ -524,6 +524,11 @@ func runUIActionPipeListener(listener net.Listener, procs map[uint32]*uiProcess,
 				logger.Error("UI action pipe: failed to read request: %v", err)
 				return
 			}
+			if !pipeClientInSession(conn, req[0]) {
+				logger.Error("UI action pipe: refused action %d for session %d from a client in another session", req[1], req[0])
+				_ = binary.Write(conn, binary.LittleEndian, uint32(1))
+				return
+			}
 			procsLock.Lock()
 			_, running := procs[req[0]]
 			procsLock.Unlock()
@@ -551,6 +556,11 @@ func handleUILaunchConn(conn net.Conn, requestCh chan<- uint32, procs map[uint32
 		return
 	}
 	logger.Debug("UI launch (service): request received for session %d", sessionID)
+	if !pipeClientInSession(conn, sessionID) {
+		logger.Error("UI launch pipe: refused a launch in session %d from a client in another session", sessionID)
+		_ = binary.Write(conn, binary.LittleEndian, uint32(2))
+		return
+	}
 
 	var response uint32
 	procsLock.Lock()
