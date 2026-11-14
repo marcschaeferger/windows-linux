@@ -448,6 +448,10 @@ func (tm *Manager) AdoptRunningTunnel(orgID string) bool {
 	if tm.State() != StateStopped {
 		return false
 	}
+	if !mayAdopt() {
+		logger.Info("The running tunnel belongs to another user; not adopting it")
+		return false
+	}
 	status, err := tm.GetOLMStatus()
 	if err != nil {
 		// No tunnel is running, so its API pipe does not exist.

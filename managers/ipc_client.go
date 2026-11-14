@@ -9,9 +9,9 @@ import (
 	"github.com/fosrl/newt/logger"
 	"github.com/fosrl/windows-linux/fingerprint"
 	"github.com/fosrl/windows-linux/logging"
-	"github.com/fosrl/windows-linux/updater"
 	"github.com/fosrl/windows-linux/managers/secretstore"
 	"github.com/fosrl/windows-linux/tunnel"
+	"github.com/fosrl/windows-linux/updater"
 )
 
 // TunnelConfig is exported for use in UI
@@ -47,7 +47,13 @@ const (
 	AlwaysOnEnabledMethodType
 	UpdateVersionMethodType
 	AutoDownloadUpdatesTurnedOnMethodType
-	ReadLogMethodType // appended last: the numbers above are part of the wire format
+	ReadLogMethodType // appended: the numbers above are part of the wire format
+	// UpdateCheckedMethodType is Update with an error reply (a refusal).
+	// UpdateMethodType stays for older UIs and gets no reply.
+	UpdateCheckedMethodType
+	// MayAdoptTunnelMethodType asks whether the running tunnel is not
+	// another user's. Reply: bool.
+	MayAdoptTunnelMethodType
 )
 
 var (
@@ -116,6 +122,7 @@ func InitializeIPCClient(reader, writer, events *os.File) {
 	rpcMutex.Unlock()
 	registerSecretsIPC()
 	registerDevicePostureIPC()
+	tunnel.SetAdoptCheck(IPCClientMayAdoptTunnel)
 	go func() {
 		defer ipcConnectionLost(generation)
 		decoder := gob.NewDecoder(events)
@@ -361,18 +368,38 @@ func IPCClientCheckForUpdates() (updateState UpdateState, err error) {
 	return
 }
 
+// IPCClientUpdate asks the manager to install the update. The manager
+// refuses users who may not install updates (the error is returned) and
+// otherwise stops the tunnels itself before the install starts.
 func IPCClientUpdate() error {
-	// Always stop any running tunnel services first
-	// Ignore errors from StopTunnel as it's safe to call even if no tunnel is running
-	_ = IPCClientStopTunnel()
-
 	rpcMutex.Lock()
 	defer rpcMutex.Unlock()
 	if rpcEncoder == nil {
 		return errIPCNotConnected
 	}
+	if err := rpcEncoder.Encode(UpdateCheckedMethodType); err != nil {
+		return err
+	}
+	return rpcDecodeError()
+}
 
-	return rpcEncoder.Encode(UpdateMethodType)
+// IPCClientMayAdoptTunnel reports whether the UI may adopt the running
+// tunnel: false when another user on the computer started it. Without an
+// answer from the manager it says yes, as before.
+func IPCClientMayAdoptTunnel() bool {
+	rpcMutex.Lock()
+	defer rpcMutex.Unlock()
+	if rpcEncoder == nil {
+		return true
+	}
+	if err := rpcEncoder.Encode(MayAdoptTunnelMethodType); err != nil {
+		return true
+	}
+	var mayAdopt bool
+	if err := rpcDecoder.Decode(&mayAdopt); err != nil {
+		return true
+	}
+	return mayAdopt
 }
 
 func IPCClientRegisterManagerStopping(cb func()) *ManagerStoppingCallback {

@@ -125,6 +125,7 @@ func Run() error {
 		}
 	}()
 	go checkForUpdates()
+	go watchTunnelOwners()
 
 	sig := <-signals
 	logger.Info("Pangolin daemon stopping on %v", sig)
@@ -230,7 +231,7 @@ func attachUI(conn *net.UnixConn, uid uint32, pid int32) {
 	}
 	// With automatic downloads on, a staged update is installed when the UI
 	// launches unless another user's UI is running, as on Windows.
-	if stagedUpdateInstalling() || (len(attachedUIs) == 0 && installStagedUpdate(uid, false, nil)) {
+	if stagedUpdateInstalling() || (len(attachedUIs) == 0 && !otherSessionsTunnelRunning(uid) && installStagedUpdate(uid, false, nil)) {
 		attachedUIsLock.Unlock()
 		logger.Info("UI for uid %d is waiting for an update to install", uid)
 		_, _ = conn.Write([]byte{attachUpdating})
@@ -388,7 +389,7 @@ func installStagedUpdateAfterQuit(uid uint32, key string) bool {
 	}
 	attachedUIsLock.Lock()
 	defer attachedUIsLock.Unlock()
-	if daemonStopping || len(attachedUIs) > 0 {
+	if daemonStopping || len(attachedUIs) > 0 || otherSessionsTunnelRunning(uid) {
 		return false
 	}
 	return installStagedUpdate(uid, false, nil)

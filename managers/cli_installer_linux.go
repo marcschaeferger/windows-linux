@@ -30,16 +30,22 @@ func IsCLIInstalled() bool {
 	return err == nil
 }
 
-// authorizeCLIInstall lets administrators (see tokenForUID) install the CLI
-// straight away. Anyone else is asked for an administrator's password by
-// polkit, as Windows asks through UAC.
+// authorizeCLIInstall asks polkit before root installs the CLI, as Windows
+// asks through UAC. Membership in sudo or wheel alone is not consent, since
+// any process of that user could ask (audit #101): an administrator types
+// their own password, kept for a few minutes (auth_admin_keep), anyone else
+// an administrator's. Only without polkit do administrators install
+// straight away, as before.
 func authorizeCLIInstall(s *ManagerService) (userToken, error) {
-	if s.elevatedToken != 0 {
-		return s.elevatedToken, nil
-	}
 	uid, err := strconv.ParseUint(s.clientUserKey, 10, 32)
 	if err != nil {
 		return 0, fmt.Errorf("unknown user %q", s.clientUserKey)
+	}
+	if uid == 0 {
+		return 1, nil
+	}
+	if _, err := exec.LookPath("pkcheck"); err != nil && s.elevatedToken != 0 {
+		return s.elevatedToken, nil
 	}
 	attachedUIsLock.Lock()
 	ui := attachedUIs[uint32(uid)]

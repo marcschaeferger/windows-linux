@@ -25,7 +25,7 @@ details are in [linux-tray-popup.md](linux-tray-popup.md); updates in
 systemd ── pangolin-client --daemon (root)
               ├─ listens /run/pangolin-client/manager.sock (0666)
               ├─ pangolin-client --tunnel /run/pangolin-client/tunnels/olm.json  (child, Pdeathsig)
-              │     └─ olm: TUN, routes, DNS; API on /run/pangolin-client/olm.sock
+              │     └─ olm: TUN, routes, DNS; API on /run/pangolin-client/olm/olm.sock (dir: root + tunnel owner)
               └─ systemd-run units: pangolin-client-update-<ts> (package installs),
                  pangolin-client-ui-<ts> (UI relaunch in a user's systemd --user)
 
@@ -106,17 +106,50 @@ When the UI's IPC connection closes (`IPCServerListen` returns `done`):
    --unit=pangolin-client-ui-<ts> <exe>`. More than 5 relaunches in a minute →
    give up and clear Always-On. A relaunch failure also clears it.
 
+Sign-out doesn't depend on the UI: `watchTunnelOwners` (`managers/authz_linux.go`)
+checks each tunnel owner every 5s and stops their tunnels after two checks in a
+row say they are gone, as Windows does on logoff. An owner who connected from a
+local seat is gone once no local seat session is left (an open SSH session
+doesn't keep the tunnel for the next person at the computer); others once
+`loginctl show-user` is no longer `active`/`online`. Without logind nothing is
+stopped.
+
 The UI's Quit clears Always-On first, so a quit doesn't trigger a relaunch.
 
 ## Admin rights
 
 `tokenForUID` (`managers/identity_linux.go`): root, or a member of `sudo`,
 `wheel` or `admin` → non-zero `elevatedToken`. Used for: installing an update
-when nothing is staged, receiving admin-only notifications. Anyone may install
-an already-staged update (equivalent to quitting).
+when nothing is staged (checked before anything is recorded or stopped, so a
+refused request leaves no relaunch record and keeps the tunnel up), receiving
+admin-only notifications. It no longer skips polkit for the CLI install, and
+`Quit` needs root, and an update while another user has a UI attached or a
+tunnel running needs root too. Anyone else may install an already-staged
+update only while no other user has a UI attached or a tunnel running; the
+installs at quit and launch also wait for another user's tunnel.
+
+Tunnel use (`authorizeTunnelUse`, `managers/authz_linux.go`), checked for
+`StartTunnel` and `GetDevicePosture`: root, then users with a session on a
+local seat (`loginctl show-user --property=Sessions`, each session
+`Remote=no`, a `Seat`, `Class=user`, not `closing`), else polkit action
+`net.pangolin.client.connect` (`allow_any` = `auth_admin_keep`) with the UI
+process as subject. Group membership doesn't skip polkit here. Without logind
+(`/run/systemd/seats` missing), accounts from UID_MIN (`/etc/login.defs`) up
+are allowed, as before. So the desktop user is never asked; an SSH-only user
+or a system account needs an administrator.
+
+The OLM socket is in `/run/pangolin-client/olm/`, because olm chmods the socket
+itself 0666. Before each tunnel start the daemon resets that directory to root
+0700 plus a POSIX ACL entry `user:<owner>:--x` (`tunnel.GrantOLMSocketAccess`),
+so only root and the owner can reach the socket; the tunnel process creates it
+0700 if missing and refuses one others can write. Without ACL support it falls
+back to 0711 (everyone, as before) and logs an error.
+`/run/pangolin-client/olm.sock` is a symlink to it for the CLI.
 
 CLI install (`managers/cli_installer_linux.go`, `managers/polkit_linux.go`):
-admins install immediately; others are asked via polkit (`pkcheck
+root installs immediately; everyone else, admins included, is asked via polkit
+(admins type their own password; without polkit installed, admins install
+immediately as before) (`pkcheck
 --allow-user-interaction`, action `net.pangolin.client.install-cli`,
 `auth_admin_keep` = 5 min) using the UI process as subject. Policy file
 `packaging/linux/net.pangolin.client.policy` must be installed (all packages
@@ -183,6 +216,8 @@ Linux (built 2026-11-02, committed in `../cli` by the owner on 2026-11-05):
   socket exists), so standalone CLI users (servers) aren't locked out.
 - The CLI checks its own `/var/run/olm.sock` before the app's
   `/run/pangolin-client/olm.sock`. `up` refuses while the app's tunnel runs.
+  That path is now a symlink into `olm/`: the CLI of the tunnel's owner (and
+  under sudo) still reaches it; other users get permission denied.
 - One-time CLI notice for Linux users without the desktop client, linking
   https://pangolin.net/downloads (`../cli/internal/notice/notices.go`).
 - Tested in containers with a static daemon harness; `pangolin up` through

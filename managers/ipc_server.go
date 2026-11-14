@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,7 @@ var (
 	managerServicesLock sync.RWMutex
 	haveQuit            uint32
 	quitManagersChan    = make(chan struct{}, 1)
-	activeTunnels       = make(map[string]uint32) // Active tunnel names and the session that started each
+	activeTunnels       = make(map[string]tunnelOwner) // Running tunnel names and who started each (tunnel_owner.go)
 	activeTunnelsLock   sync.RWMutex
 	alwaysOnUsers       = make(map[string]bool)
 	alwaysOnUsersLock   sync.Mutex
@@ -82,6 +83,12 @@ func (s *ManagerService) AlwaysOnEnabled() bool {
 }
 
 func (s *ManagerService) Quit(stopTunnelsOnQuit bool) (alreadyQuit bool, err error) {
+	// Quit stops (and on Windows uninstalls) the manager for every user, and
+	// the UI never sends it, so only an administrator (root on Linux) may.
+	if !quitAllowed(s) {
+		logger.Error("IPC server: Quit refused for %s: not an administrator", s.clientUserKey)
+		return false, errors.New("stopping the Pangolin manager needs an administrator")
+	}
 	if !atomic.CompareAndSwapUint32(&haveQuit, 0, 1) {
 		return true, nil
 	}
@@ -218,102 +225,45 @@ func (s *ManagerService) StartTunnel(config tunnel.Config) error {
 		}
 	}
 
-	// Set up callback to notify on state changes
-	tunnel.SetStateChangeCallback(func(state TunnelState) {
-		IPCServerNotifyTunnelStateChange(state)
-	})
-
-	// Set up callbacks for tunnel service to call install/uninstall
-	tunnel.SetInstallTunnelCallback(InstallTunnel)
-	tunnel.SetUninstallTunnelCallback(func(name string) error {
-		return UninstallTunnel(name)
-	})
+	// State changes go to this user's UIs only.
+	setTunnelCallbacks(s.clientUserKey)
 
 	err := tunnel.StartTunnel(config)
 	if err != nil {
 		return err
 	}
 	// Track this tunnel as active
-	activeTunnelsLock.Lock()
-	activeTunnels[config.Name] = s.session
-	activeTunnelsLock.Unlock()
+	s.recordStartedTunnel(config.Name)
 	// Notify UI of initial state change (starting)
 	state := tunnel.GetState()
-	IPCServerNotifyTunnelStateChange(state)
+	notifyTunnelState(s.clientUserKey, state)
 	return nil
 }
 
+// StopTunnel stops this client's user's tunnel; another user's keeps running.
 func (s *ManagerService) StopTunnel() error {
-	// Set up callback to notify on state changes
-	tunnel.SetStateChangeCallback(func(state TunnelState) {
-		IPCServerNotifyTunnelStateChange(state)
-	})
-
-	// Set up callbacks for tunnel service to call install/uninstall
-	tunnel.SetInstallTunnelCallback(InstallTunnel)
-	tunnel.SetUninstallTunnelCallback(func(name string) error {
-		return UninstallTunnel(name)
-	})
-
-	err := tunnel.StopTunnel()
-	if err != nil {
-		return err
-	}
-	// Remove tunnel from active list
-	// Get the tunnel name from the tunnel package
-	tunnelName := tunnel.GetTunnelName()
-	if tunnelName != "" {
-		activeTunnelsLock.Lock()
-		delete(activeTunnels, tunnelName)
-		activeTunnelsLock.Unlock()
-	}
-	// Notify UI of initial state change (stopping)
-	state := tunnel.GetState()
-	IPCServerNotifyTunnelStateChange(state)
-	return nil
+	tunnelOpLock.Lock()
+	defer tunnelOpLock.Unlock()
+	return s.stopOwnTunnel()
 }
 
+// StopAllTunnels stops the tunnels this client's user started, for Quit from
+// the tray. Other users' tunnels keep running.
 func (s *ManagerService) StopAllTunnels() error {
-	tunnel.SetStateChangeCallback(func(state TunnelState) {
-		IPCServerNotifyTunnelStateChange(state)
-	})
-	tunnel.SetInstallTunnelCallback(InstallTunnel)
-	tunnel.SetUninstallTunnelCallback(func(name string) error {
-		return UninstallTunnel(name)
-	})
-
-	stopActiveTunnels()
+	tunnelOpLock.Lock()
+	defer tunnelOpLock.Unlock()
+	setTunnelCallbacks(s.clientUserKey)
+	stopOwnedTunnels(func(owner tunnelOwner) bool { return owner.userKey == s.clientUserKey }, "Quit")
 	return nil
 }
 
 // stopSessionTunnels stops the tunnels started from a session, so a tunnel
 // does not stay connected with a user's credentials after they sign out.
 func stopSessionTunnels(session uint32) {
-	activeTunnelsLock.Lock()
-	tunnelNames := make([]string, 0, len(activeTunnels))
-	for name, owner := range activeTunnels {
-		if owner == session {
-			tunnelNames = append(tunnelNames, name)
-		}
-	}
-	activeTunnelsLock.Unlock()
-
-	for _, name := range tunnelNames {
-		logger.Info("Session %d signed out, stopping tunnel: %s", session, name)
-		if err := UninstallTunnel(name); err != nil {
-			logger.Error("Failed to stop tunnel %s: %v", name, err)
-			continue
-		}
-		activeTunnelsLock.Lock()
-		if activeTunnels[name] == session {
-			delete(activeTunnels, name)
-		}
-		activeTunnelsLock.Unlock()
-		if tunnel.GetTunnelName() == name {
-			tunnel.SetState(tunnel.StateStopped)
-		}
-		IPCServerNotifyTunnelStateChange(tunnel.StateStopped)
-	}
+	tunnelOpLock.Lock()
+	defer tunnelOpLock.Unlock()
+	stopOwnedTunnels(func(owner tunnelOwner) bool { return owner.session == session },
+		"Session "+strconv.FormatUint(uint64(session), 10)+" signed out")
 }
 
 // stopActiveTunnels stops every tunnel the manager started.
@@ -374,6 +324,12 @@ func (s *ManagerService) DeleteUserSecrets(userID string, flags secretstore.Dele
 }
 
 func (s *ManagerService) GetDevicePosture() (fingerprint.DevicePostureSnapshot, error) {
+	// The manager gathered it with its privileges (on Linux it includes
+	// root-only data such as the DMI serial), so it needs the same
+	// authorization as connecting.
+	if err := authorizeTunnelUse(s); err != nil {
+		return fingerprint.DevicePostureSnapshot{}, err
+	}
 	snapshot, ok := fingerprint.CachedDevicePosture()
 	if !ok {
 		logger.Debug("IPC server: GetDevicePosture() cache miss, refreshing")
@@ -447,15 +403,24 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 			if err != nil {
 				return
 			}
-		case UpdateMethodType:
-			s.Update()
+		case UpdateMethodType, UpdateCheckedMethodType:
+			// Checked here, before Update records or stops anything. Only
+			// UpdateCheckedMethodType gets the result as a reply.
+			retErr := s.authorizeUpdate()
+			if retErr == nil {
+				stopTunnelsForUpdate()
+				s.Update()
+			}
+			if methodType == UpdateCheckedMethodType && encoder.Encode(errToString(retErr)) != nil {
+				return
+			}
 		case StartTunnelMethodType:
 			var config tunnel.Config
 			err := decoder.Decode(&config)
 			if err != nil {
 				return
 			}
-			retErr := s.StartTunnel(config)
+			retErr := s.startTunnelChecked(config)
 			err = encoder.Encode(errToString(retErr))
 			if err != nil {
 				return
@@ -464,6 +429,10 @@ func (s *ManagerService) ServeConn(reader io.Reader, writer io.Writer) {
 			retErr := s.StopTunnel()
 			err = encoder.Encode(errToString(retErr))
 			if err != nil {
+				return
+			}
+		case MayAdoptTunnelMethodType:
+			if encoder.Encode(s.mayAdoptTunnel()) != nil {
 				return
 			}
 		case StopAllTunnelsMethodType:
