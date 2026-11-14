@@ -186,7 +186,7 @@ export const MenuService = {
 export const PreferencesService = {
   Opened: () => ok<PrefsOpened>({
     tab: Number(params.get("tab") ?? 0), settings,
-    login: params.has("step") ? { id: 1, hostname: params.get("renew") ?? "" } : null,
+    login: params.has("step") ? { id: 1, hostname: params.get("renew") ?? "", userId: "" } : null,
   }),
   Update: (f: Settings) => {
     Object.assign(settings, f);
@@ -207,7 +207,7 @@ export const LogsService = {
 };
 export const LoginService = {
   State: () => ok(loginView(params.get("step") ?? "server")),
-  Open: (renew: string) => ok(loginView(params.get("step") ?? (renew ? "loading" : "server"), { renewing: !!renew, fixedHost: !!renew })),
+  Open: (renew: string, _userId?: string) => ok(loginView(params.get("step") ?? (renew ? "loading" : "server"), { renewing: !!renew, fixedHost: !!renew })),
   Start: mockLoginStart, Back: () => ok(log("back")), Close: (id: number) => ok(log("close", id)),
   CopyCode: () => ok(log("copy")), OpenBrowser: () => ok(log("browser")),
 };

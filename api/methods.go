@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +38,7 @@ func (c *APIClient) Login(email, password string, code *string) (*LoginResponse,
 	}
 
 	// Extract session token from cookie
-	sessionToken := extractCookie(resp, c.sessionCookieName)
+	sessionToken := extractCookie(resp, c.SessionCookieName())
 	if sessionToken == "" {
 		sessionToken = extractCookie(resp, "p_session")
 	}
@@ -51,6 +52,11 @@ func (c *APIClient) Login(email, password string, code *string) (*LoginResponse,
 
 // StartDeviceAuth starts a device authentication flow
 func (c *APIClient) StartDeviceAuth(applicationName string, deviceName *string) (*DeviceAuthStartResponse, error) {
+	return c.StartDeviceAuthContext(context.Background(), applicationName, deviceName)
+}
+
+// StartDeviceAuthContext is StartDeviceAuth, aborted when ctx is done.
+func (c *APIClient) StartDeviceAuthContext(ctx context.Context, applicationName string, deviceName *string) (*DeviceAuthStartResponse, error) {
 	requestBody := DeviceAuthStartRequest{
 		ApplicationName: applicationName,
 		DeviceName:      deviceName,
@@ -61,7 +67,7 @@ func (c *APIClient) StartDeviceAuth(applicationName string, deviceName *string) 
 		return nil, &APIError{Type: ErrorTypeDecodingError, Err: err}
 	}
 
-	data, resp, err := c.makeRequest("POST", "/auth/device-web-auth/start", bodyData)
+	data, resp, err := c.makeRequestContext(ctx, "POST", "/auth/device-web-auth/start", bodyData)
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +82,13 @@ func (c *APIClient) StartDeviceAuth(applicationName string, deviceName *string) 
 
 // PollDeviceAuth polls for device authentication status
 func (c *APIClient) PollDeviceAuth(code string) (*DeviceAuthPollResponse, *string, error) {
+	return c.PollDeviceAuthContext(context.Background(), code)
+}
+
+// PollDeviceAuthContext is PollDeviceAuth, aborted when ctx is done.
+func (c *APIClient) PollDeviceAuthContext(ctx context.Context, code string) (*DeviceAuthPollResponse, *string, error) {
 	path := fmt.Sprintf("/auth/device-web-auth/poll/%s", code)
-	data, resp, err := c.makeRequest("GET", path, nil)
+	data, resp, err := c.makeRequestContext(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -93,7 +104,7 @@ func (c *APIClient) PollDeviceAuth(code string) (*DeviceAuthPollResponse, *strin
 		sessionToken = pollResponse.Token
 	} else {
 		// Also try to extract from cookie
-		token := extractCookie(resp, c.sessionCookieName)
+		token := extractCookie(resp, c.SessionCookieName())
 		if token != "" {
 			sessionToken = &token
 		}
@@ -102,9 +113,10 @@ func (c *APIClient) PollDeviceAuth(code string) (*DeviceAuthPollResponse, *strin
 	return &pollResponse, sessionToken, nil
 }
 
-// Logout logs out the current user
+// Logout logs out the current user. A 401 here only means the session had
+// already ended, so it doesn't report the session as expired.
 func (c *APIClient) Logout() error {
-	data, resp, err := c.makeRequest("POST", "/auth/logout", []byte("{}"))
+	data, resp, err := c.doRequest(context.Background(), "POST", "/auth/logout", []byte("{}"), false)
 	if err != nil {
 		return err
 	}
@@ -115,7 +127,12 @@ func (c *APIClient) Logout() error {
 
 // GetUser gets the current user information
 func (c *APIClient) GetUser() (*User, error) {
-	data, resp, err := c.makeRequest("GET", "/user", nil)
+	return c.GetUserContext(context.Background())
+}
+
+// GetUserContext is GetUser, aborted when ctx is done.
+func (c *APIClient) GetUserContext(ctx context.Context) (*User, error) {
+	data, resp, err := c.makeRequestContext(ctx, "GET", "/user", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -371,6 +388,10 @@ func (c *APIClient) GetMyClientSettings(orgID string) (*config.ClientSettings, e
 	return response.Settings, nil
 }
 
+// maxGatewayResourcePages bounds ListGatewayResources (100 000 resources), so
+// a server that misbehaves can't keep it requesting forever.
+const maxGatewayResourcePages = 1000
+
 // ListGatewayResources returns every gateway-mode site resource in the org
 // (with the IDs of the sites backing each one), fetching all pages. Gateway
 // resources are what the client calls exit nodes.
@@ -378,7 +399,8 @@ func (c *APIClient) ListGatewayResources(orgID string) ([]SiteResource, error) {
 	const pageSize = 100
 
 	var gateways []SiteResource
-	for page := 1; ; page++ {
+	seen := make(map[int]bool)
+	for page := 1; page <= maxGatewayResourcePages; page++ {
 		params := url.Values{}
 		params.Set("mode", "gateway")
 		params.Set("page", strconv.Itoa(page))
@@ -395,15 +417,27 @@ func (c *APIClient) ListGatewayResources(orgID string) ([]SiteResource, error) {
 			return nil, err
 		}
 
-		// Servers that predate gateway mode ignore the unknown filter value and
-		// return every resource, so filter again here.
+		newRows := 0
 		for _, r := range response.SiteResources {
+			if seen[r.SiteResourceID] {
+				continue
+			}
+			seen[r.SiteResourceID] = true
+			newRows++
+			// Servers that predate gateway mode ignore the unknown filter value and
+			// return every resource, so filter again here.
 			if r.Mode == "gateway" {
 				gateways = append(gateways, r)
 			}
 		}
 
 		if len(response.SiteResources) < pageSize {
+			break
+		}
+		// Servers from before page/pageSize pagination (Pangolin 1.15 and
+		// older) ignore those parameters and return the same rows for every
+		// page. A page with nothing new means there is nothing more to get.
+		if newRows == 0 {
 			break
 		}
 	}

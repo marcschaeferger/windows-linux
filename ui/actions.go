@@ -40,13 +40,14 @@ func invokeMenuItem(id string) {
 		showUpdateWindow()
 	case id == menuIDReAuth:
 		// Log in again to the active account, from Preferences > Accounts.
-		var hostname string
+		req := &LoginRequest{}
 		if accountManager != nil {
 			if active, _ := accountManager.ActiveAccount(); active != nil {
-				hostname = active.Hostname
+				req.Hostname = active.Hostname
+				req.UserID = active.UserID
 			}
 		}
-		showPreferencesWindow(prefsTabAccounts, &LoginRequest{Hostname: hostname})
+		showPreferencesWindow(prefsTabAccounts, req)
 	case id == menuIDConnect:
 		toggleConnection()
 	case id == menuIDLogin, id == menuIDAddAccount:
@@ -147,7 +148,7 @@ func switchAccount(userID string) {
 	if accountManager == nil || authManager == nil {
 		return
 	}
-	if _, ok := accountManager.Accounts[userID]; !ok {
+	if _, ok := accountManager.Account(userID); !ok {
 		logger.Error("Account %s no longer exists", userID)
 		publish()
 		return
@@ -234,10 +235,12 @@ func selectOrganization(orgID string) {
 // logout signs out of the active account and removes it, like the macOS
 // client's Log Out.
 func logout() {
-	if accountManager == nil || accountManager.ActiveUserID == "" {
+	if accountManager == nil {
 		return
 	}
-	deleteAccount(accountManager.ActiveUserID)
+	if active := accountManager.ActiveUserID(); active != "" {
+		deleteAccount(active)
+	}
 }
 
 // quit stops any active tunnels and exits the UI process. The manager service keeps running.

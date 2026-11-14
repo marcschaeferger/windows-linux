@@ -75,6 +75,12 @@ export interface LoginRequest {
      * Hostname is the server of an account to log in to again, or "" to add one.
      */
     "hostname": string;
+
+    /**
+     * UserID is the account to log in to again, if known. Several accounts
+     * can share a server.
+     */
+    "userId": string;
 }
 
 /**

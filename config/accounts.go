@@ -14,11 +14,24 @@ const (
 	AccountsFileName = "accounts.json"
 )
 
+// AccountManager holds the saved accounts. Its state is only reached through
+// its methods, which take mu: the UI reads it from many goroutines while
+// others write it, and an unlocked map iteration during a write is a fatal
+// runtime error.
 type AccountManager struct {
 	mu sync.RWMutex
 
 	path string
+	// readOnly is set when the file exists but could not be read; saving
+	// would then replace accounts this run never saw.
+	readOnly bool
 
+	activeUserID string
+	accounts     map[string]Account
+}
+
+// accountsFile is the on-disk form of accounts.json.
+type accountsFile struct {
 	ActiveUserID string             `json:"activeUserId"`
 	Accounts     map[string]Account `json:"accounts"`
 }
@@ -49,37 +62,51 @@ func (s OrgSettings) IsEmpty() bool {
 
 func NewAccountManager() *AccountManager {
 	pangolinDir := UserDataDir()
-	accountsPath := filepath.Join(pangolinDir, AccountsFileName)
-
-	mgr := &AccountManager{
-		path:     accountsPath,
-		Accounts: make(map[string]Account),
-	}
-
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(pangolinDir, 0o755); err != nil {
 		logger.Error("Failed to create config directory: %v", err)
 	}
+	return loadAccountManager(filepath.Join(pangolinDir, AccountsFileName))
+}
 
-	data, err := os.ReadFile(accountsPath)
+// loadAccountManager reads the accounts file at path. A missing file starts
+// empty. A file that can't be parsed is copied aside first, so the next save
+// does not silently drop every account in it.
+func loadAccountManager(path string) *AccountManager {
+	mgr := &AccountManager{
+		path:     path,
+		accounts: make(map[string]Account),
+	}
+
+	data, err := os.ReadFile(path)
 	if err != nil {
-		mgr.Save()
-
-		logger.Error("failed to read accounts file: %v", err)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := mgr.Save(); err != nil {
+				logger.Error("failed to create accounts file: %v", err)
+			}
+			return mgr
+		}
+		logger.Error("failed to read accounts file, not saving changes to it: %v", err)
+		mgr.readOnly = true
 		return mgr
 	}
 
-	if err := json.Unmarshal(data, mgr); err != nil {
+	var file accountsFile
+	if err := json.Unmarshal(data, &file); err != nil {
 		logger.Error("failed to parse accounts file: %v", err)
+		backupCorruptFile(path, data, accountsFileMode)
 		return mgr
 	}
 
-	if mgr.Accounts == nil {
-		mgr.Accounts = make(map[string]Account)
+	if file.Accounts != nil {
+		mgr.accounts = file.Accounts
 	}
-
+	mgr.activeUserID = file.ActiveUserID
 	return mgr
 }
+
+// accountsFileMode keeps accounts.json private to the user.
+const accountsFileMode = 0o600
 
 func (m *AccountManager) Save() error {
 	m.mu.RLock()
@@ -88,26 +115,73 @@ func (m *AccountManager) Save() error {
 }
 
 func (m *AccountManager) saveLocked() error {
-	data, err := json.MarshalIndent(m, "", "  ")
+	if m.readOnly {
+		return errors.New("accounts file could not be read at startup; not overwriting it")
+	}
+	data, err := json.MarshalIndent(accountsFile{ActiveUserID: m.activeUserID, Accounts: m.accounts}, "", "  ")
 	if err != nil {
 		return err
 	}
+	return writeFileAtomic(m.path, data, accountsFileMode)
+}
 
-	if err := os.WriteFile(m.path, data, 0o600); err != nil {
-		return err
+// ActiveUserID returns the active account's user ID, or "" if none is active.
+func (m *AccountManager) ActiveUserID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.activeUserID
+}
+
+// Account returns a copy of the account for userID.
+func (m *AccountManager) Account(userID string) (Account, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	account, ok := m.accounts[userID]
+	if !ok {
+		return Account{}, false
 	}
+	return copyAccount(account), true
+}
 
-	return nil
+// Accounts returns a copy of every account, in no particular order.
+func (m *AccountManager) Accounts() []Account {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Account, 0, len(m.accounts))
+	for _, account := range m.accounts {
+		out = append(out, copyAccount(account))
+	}
+	return out
+}
+
+// HasAccounts reports whether any account is saved.
+func (m *AccountManager) HasAccounts() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.accounts) > 0
+}
+
+// copyAccount copies an account so callers can't share its OrgSettings map
+// with the manager.
+func copyAccount(a Account) Account {
+	if a.OrgSettings != nil {
+		settings := make(map[string]OrgSettings, len(a.OrgSettings))
+		for id, s := range a.OrgSettings {
+			settings[id] = s
+		}
+		a.OrgSettings = settings
+	}
+	return a
 }
 
 func (m *AccountManager) AddAccount(account Account) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, ok := m.Accounts[account.UserID]; ok && len(existing.OrgSettings) > 0 {
+	if existing, ok := m.accounts[account.UserID]; ok && len(existing.OrgSettings) > 0 {
 		account.OrgSettings = existing.OrgSettings
 	}
-	m.Accounts[account.UserID] = account
+	m.accounts[account.UserID] = account
 	return m.saveLocked()
 }
 
@@ -115,10 +189,10 @@ func (m *AccountManager) RemoveAccount(userID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.Accounts, userID)
+	delete(m.accounts, userID)
 
-	if m.ActiveUserID == userID {
-		m.ActiveUserID = ""
+	if m.activeUserID == userID {
+		m.activeUserID = ""
 	}
 
 	return m.saveLocked()
@@ -128,15 +202,16 @@ func (m *AccountManager) ActiveAccount() (*Account, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.ActiveUserID == "" {
+	if m.activeUserID == "" {
 		return nil, errors.New("no active account")
 	}
 
-	account, ok := m.Accounts[m.ActiveUserID]
+	account, ok := m.accounts[m.activeUserID]
 	if !ok {
 		return nil, errors.New("active account not present in list")
 	}
 
+	account = copyAccount(account)
 	return &account, nil
 }
 
@@ -144,11 +219,14 @@ func (m *AccountManager) SetActiveUser(userID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.Accounts[userID]; !ok {
+	if _, ok := m.accounts[userID]; !ok {
 		return errors.New("account does not exist")
 	}
+	if m.activeUserID == userID {
+		return nil
+	}
 
-	m.ActiveUserID = userID
+	m.activeUserID = userID
 	return m.saveLocked()
 }
 
@@ -156,9 +234,12 @@ func (m *AccountManager) SetUserOrganization(userID string, orgID string) error 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if account, ok := m.Accounts[userID]; ok {
+	if account, ok := m.accounts[userID]; ok {
+		if account.OrgID == orgID {
+			return nil
+		}
 		account.OrgID = orgID
-		m.Accounts[userID] = account // Put the modified account back in the map
+		m.accounts[userID] = account // Put the modified account back in the map
 	} else {
 		return errors.New("account does not exist")
 	}
@@ -172,7 +253,7 @@ func (m *AccountManager) GetOrgSettings(userID, orgID string) OrgSettings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return m.Accounts[userID].OrgSettings[orgID]
+	return m.accounts[userID].OrgSettings[orgID]
 }
 
 // UpdateOrgSettings updates the settings for orgID under userID. Empty settings
@@ -181,7 +262,7 @@ func (m *AccountManager) UpdateOrgSettings(userID, orgID string, update func(*Or
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	account, ok := m.Accounts[userID]
+	account, ok := m.accounts[userID]
 	if !ok {
 		return errors.New("account does not exist")
 	}
@@ -201,7 +282,7 @@ func (m *AccountManager) UpdateOrgSettings(userID, orgID string, update func(*Or
 		settings = nil
 	}
 	account.OrgSettings = settings
-	m.Accounts[userID] = account
+	m.accounts[userID] = account
 	return m.saveLocked()
 }
 
@@ -237,10 +318,14 @@ func (m *AccountManager) UpdateAccountUserInfo(userID, username, name string) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if account, ok := m.Accounts[userID]; ok {
+	if account, ok := m.accounts[userID]; ok {
+		// Called on every tray open; don't rewrite the file for nothing.
+		if account.Username == username && account.Name == name {
+			return nil
+		}
 		account.Username = username
 		account.Name = name
-		m.Accounts[userID] = account // Put the modified account back in the map
+		m.accounts[userID] = account // Put the modified account back in the map
 	} else {
 		return errors.New("account does not exist")
 	}

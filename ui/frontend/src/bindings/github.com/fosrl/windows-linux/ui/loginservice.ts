@@ -31,10 +31,11 @@ export function CopyCode(): $CancellablePromise<void> {
 
 /**
  * Open starts a session for a newly shown sheet; renewHostname is the server
- * of an account to log in to again, or "" to add an account.
+ * of an account to log in to again, or "" to add an account, and renewUserID
+ * that account's user ID, if known.
  */
-export function Open(renewHostname: string): $CancellablePromise<$models.LoginView> {
-    return $Call.ByID(2960959556, renewHostname);
+export function Open(renewHostname: string, renewUserID: string): $CancellablePromise<$models.LoginView> {
+    return $Call.ByID(2960959556, renewHostname, renewUserID);
 }
 
 export function OpenBrowser(): $CancellablePromise<void> {
