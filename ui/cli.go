@@ -79,16 +79,21 @@ func setCLIInfo(info CLIInfo) {
 // installCLI downloads and runs the CLI installer through the manager,
 // showing its progress and result in the window.
 func installCLI() {
+	// Check and set the phase in one step, so a double click can't start two installs.
 	cliMu.Lock()
 	if cliInfo.Phase == cliPhaseInstalling {
 		cliMu.Unlock()
 		return
 	}
+	cliInfo = CLIInfo{Phase: cliPhaseInstalling}
+	info, w := cliInfo, cliWindow
 	cliMu.Unlock()
+	if w != nil {
+		w.EmitEvent(eventCLIState, info)
+	}
 
 	logger.Info("Starting Pangolin CLI installer via manager...")
 	setCLIInstallInProgress(true)
-	setCLIInfo(CLIInfo{Phase: cliPhaseInstalling})
 
 	err := managers.IPCClientInstallCLI()
 	setCLIInstallInProgress(false)
