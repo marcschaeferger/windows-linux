@@ -286,12 +286,17 @@ func (c *APIClient) GetClient(clientId int) (*GetClientResponse, error) {
 
 // GetMyDevice gets the current device information including user, organizations, and OLM
 func (c *APIClient) GetMyDevice(olmId string) (*MyDeviceResponse, error) {
+	return c.GetMyDeviceContext(context.Background(), olmId)
+}
+
+// GetMyDeviceContext is GetMyDevice bounded by ctx.
+func (c *APIClient) GetMyDeviceContext(ctx context.Context, olmId string) (*MyDeviceResponse, error) {
 	// Build query parameters
 	params := url.Values{}
 	params.Set("olmId", olmId)
 	path := fmt.Sprintf("/my-device?%s", params.Encode())
 
-	data, resp, err := c.makeRequest("GET", path, nil)
+	data, resp, err := c.makeRequestContext(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -443,4 +448,101 @@ func (c *APIClient) ListGatewayResources(orgID string) ([]SiteResource, error) {
 	}
 
 	return gateways, nil
+}
+
+// UpdateClientName renames one client (a device in one org). It needs the
+// updateClient permission, which the default Member role lacks (403).
+func (c *APIClient) UpdateClientName(ctx context.Context, clientId int, name string) error {
+	bodyData, err := json.Marshal(UpdateClientRequest{Name: name})
+	if err != nil {
+		return &APIError{Type: ErrorTypeDecodingError, Err: err}
+	}
+
+	path := fmt.Sprintf("/client/%d", clientId)
+	data, resp, err := c.makeRequestContext(ctx, "POST", path, bodyData)
+	if err != nil {
+		return err
+	}
+
+	var response EmptyResponse
+	return c.parseResponse(data, resp, &response)
+}
+
+// ListUserOlms returns all of the user's devices (olms), including archived
+// ones; it fails rather than return part of them.
+func (c *APIClient) ListUserOlms(ctx context.Context, userId string) ([]Olm, error) {
+	path := fmt.Sprintf("/user/%s/olms", url.PathEscape(userId))
+	data, resp, err := c.makeRequestContext(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response ListUserOlmsResponse
+	if err := c.parseResponse(data, resp, &response); err != nil {
+		return nil, err
+	}
+	// The server pages the listing (1000 by default); callers rely on it
+	// being complete.
+	if p := response.Pagination; p != nil && p.Total > len(response.Olms) {
+		return nil, &APIError{Type: ErrorTypeDecodingError,
+			Err: fmt.Errorf("listed %d of the user's %d devices", len(response.Olms), p.Total)}
+	}
+	return response.Olms, nil
+}
+
+// ListUserDevices returns the user devices (clients) in an org that belong to
+// userId, fetching all pages. It needs the listClients permission (403 without).
+//
+// The userId filter only exists since Pangolin 1.26.0; older servers validate
+// the query strictly and answer 400 to it, so on a 400 the listing is repeated
+// without the filter. Either way only devices the server reports as userId's
+// are returned.
+func (c *APIClient) ListUserDevices(ctx context.Context, orgId, userId string) ([]UserDevice, error) {
+	devices, err := c.listUserDevices(ctx, orgId, userId, true)
+	if HTTPStatus(err) == http.StatusBadRequest {
+		devices, err = c.listUserDevices(ctx, orgId, userId, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	mine := devices[:0]
+	for _, d := range devices {
+		if d.UserId != nil && *d.UserId == userId {
+			mine = append(mine, d)
+		}
+	}
+	return mine, nil
+}
+
+func (c *APIClient) listUserDevices(ctx context.Context, orgId, userId string, filterByUser bool) ([]UserDevice, error) {
+	const pageSize = 100
+	const maxPages = 50
+
+	var devices []UserDevice
+	for page := 1; page <= maxPages; page++ {
+		params := url.Values{}
+		if filterByUser {
+			params.Set("userId", userId)
+		}
+		params.Set("status", "active,pending,blocked")
+		params.Set("page", strconv.Itoa(page))
+		params.Set("pageSize", strconv.Itoa(pageSize))
+		path := fmt.Sprintf("/org/%s/user-devices?%s", url.PathEscape(orgId), params.Encode())
+
+		data, resp, err := c.makeRequestContext(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var response ListUserDevicesResponse
+		if err := c.parseResponse(data, resp, &response); err != nil {
+			return nil, err
+		}
+		devices = append(devices, response.Devices...)
+
+		if len(response.Devices) < pageSize {
+			break
+		}
+	}
+	return devices, nil
 }

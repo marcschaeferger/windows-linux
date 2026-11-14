@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fosrl/newt/logger"
+	"github.com/fosrl/windows-linux/auth"
 	"github.com/fosrl/windows-linux/config"
 	"github.com/fosrl/windows-linux/managers"
 )
@@ -19,6 +21,10 @@ const (
 	minMTU = 576
 	maxMTU = 9000
 )
+
+// deviceNameSyncTimeout bounds renaming the device on the server after the
+// device name setting changes.
+const deviceNameSyncTimeout = time.Minute
 
 // settingsScopeOrg is the Update scope that saves a change to the current org's
 // section of pangolin.json; anything else saves to the global settings.
@@ -41,6 +47,11 @@ type Settings struct {
 	// AutoDownloadUpdatesUnavailable explains why this copy can't install updates
 	// itself (Linux AUR and hand-installed builds); empty when it can.
 	AutoDownloadUpdatesUnavailable string `json:"autoDownloadUpdatesUnavailable"`
+	// DeviceName is the name the user chose for this device on the server, or
+	// empty to use the computer's hostname. It is an application setting.
+	DeviceName string `json:"deviceName"`
+	// DeviceNameDefault is the name used when DeviceName is empty.
+	DeviceNameDefault string `json:"deviceNameDefault"`
 	// Disabled is set when an administrator has turned off user settings.
 	Disabled bool `json:"disabled"`
 	// OrgID is the org the form was filled in for, empty if there is none. A
@@ -245,6 +256,8 @@ func currentSettings() Settings {
 		ExitNodeTakesPrecedence:        effective.ExitNodeTakesPrecedence,
 		AutoDownloadUpdates:            cm.GetAutoDownloadUpdates(),
 		AutoDownloadUpdatesUnavailable: autoDownloadUpdatesUnavailable(),
+		DeviceName:                     cm.GetDeviceNameOverride(),
+		DeviceNameDefault:              config.DefaultDeviceName(),
 		Disabled:                       cm.GetUserSettingsDisabled(),
 		OrgID:                          orgID,
 		OrgName:                        orgName,
@@ -259,11 +272,17 @@ func isValidIPAddress(ip string) bool {
 
 // SettingsResult is the outcome of applying a settings change. On a
 // validation error nothing is saved and Field names the invalid field
-// ("mtu", "primaryDns" or "secondaryDns") so the sheet can show Error inline.
+// ("mtu", "primaryDns", "secondaryDns" or "deviceName") so the sheet can show
+// Error inline.
 type SettingsResult struct {
 	Settings Settings `json:"settings"`
 	Field    string   `json:"field"`
 	Error    string   `json:"error"`
+	// DeviceNameStatus describes renaming the device on the server after the
+	// device name changed; empty when it didn't change.
+	DeviceNameStatus string `json:"deviceNameStatus"`
+	// DeviceNameStatusKind is "ok", "warning" or "error".
+	DeviceNameStatusKind string `json:"deviceNameStatusKind"`
 }
 
 // tunnelChanges returns what changed between the shown and submitted forms. Only
@@ -368,6 +387,11 @@ func applySettings(form Settings, scope string) SettingsResult {
 	if changing("secondaryDns", secondaryDNS, prev.SecondaryDNS) && secondaryDNS != "" && !isValidIPAddress(secondaryDNS) {
 		return invalid("secondaryDns", "Enter an IP address for the DNS server (e.g., 1.1.1.1)")
 	}
+	deviceName := strings.TrimSpace(form.DeviceName)
+	if config.DeviceNameLength(deviceName) > config.MaxDeviceNameLength {
+		return invalid("deviceName", fmt.Sprintf("Enter at most %d characters", config.MaxDeviceNameLength))
+	}
+	deviceNameChanged := deviceName != configManager.GetDeviceNameOverride()
 
 	changes := tunnelChanges(prev, form, mtu, primaryDNS, secondaryDNS)
 	orgID := prev.OrgID
@@ -385,6 +409,9 @@ func applySettings(form Settings, scope string) SettingsResult {
 	cfg.AutoConnectAtLogin = &autoConnect
 	cfg.OpenUIAtLogin = &openAtLogin
 	cfg.AutoDownloadUpdatesEnabled = &autoDownloadUpdates
+	if deviceNameChanged {
+		cfg.DeviceName = config.DeviceNameSetting(deviceName, config.SystemSetsDeviceName())
+	}
 	if !saveToOrg {
 		applyGlobalChanges(cfg, changes)
 	}
@@ -402,7 +429,35 @@ func applySettings(form Settings, scope string) SettingsResult {
 			logger.Error("Failed to notify manager of automatic update downloads: %v", err)
 		}
 	}
-	return SettingsResult{Settings: currentSettings()}
+	result := SettingsResult{Settings: currentSettings()}
+	if saved && deviceNameChanged {
+		result.DeviceNameStatus, result.DeviceNameStatusKind = syncDeviceName()
+	}
+	return result
+}
+
+// syncDeviceName renames this device on the server to the name now in effect,
+// and describes the outcome for the Preferences window. The Preferences
+// window waits for it; requests are bounded by deviceNameSyncTimeout.
+func syncDeviceName() (status, kind string) {
+	if authManager == nil || configManager == nil {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deviceNameSyncTimeout)
+	defer cancel()
+	result := authManager.SyncDeviceName(ctx, configManager.EffectiveDeviceName())
+	return result.Message(), deviceNameStatusKind(result.Status)
+}
+
+func deviceNameStatusKind(status auth.DeviceNameSyncStatus) string {
+	switch status {
+	case auth.DeviceNameRenamed, auth.DeviceNameSkipped:
+		return "ok"
+	case auth.DeviceNamePartial, auth.DeviceNamePermissionDenied:
+		return "warning"
+	default:
+		return "error"
+	}
 }
 
 // resetOrgSettings makes the current org use the global settings again.

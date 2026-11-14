@@ -45,6 +45,12 @@ type Account struct {
 	Hostname string `json:"hostname"`
 
 	OrgSettings map[string]OrgSettings `json:"orgSettings,omitempty"`
+
+	// DeviceNameMigrations records, per olm ID, the name this device was last
+	// automatically renamed to from a generic "<OS> Laptop/Desktop" name, so
+	// the rename isn't retried on every start (e.g. when the user's role may not
+	// rename devices).
+	DeviceNameMigrations map[string]string `json:"deviceNameMigrations,omitempty"`
 }
 
 type OrgSettings struct {
@@ -161,8 +167,8 @@ func (m *AccountManager) HasAccounts() bool {
 	return len(m.accounts) > 0
 }
 
-// copyAccount copies an account so callers can't share its OrgSettings map
-// with the manager.
+// copyAccount copies an account so callers can't share its OrgSettings or
+// DeviceNameMigrations map with the manager.
 func copyAccount(a Account) Account {
 	if a.OrgSettings != nil {
 		settings := make(map[string]OrgSettings, len(a.OrgSettings))
@@ -171,6 +177,13 @@ func copyAccount(a Account) Account {
 		}
 		a.OrgSettings = settings
 	}
+	if a.DeviceNameMigrations != nil {
+		migrations := make(map[string]string, len(a.DeviceNameMigrations))
+		for id, n := range a.DeviceNameMigrations {
+			migrations[id] = n
+		}
+		a.DeviceNameMigrations = migrations
+	}
 	return a
 }
 
@@ -178,8 +191,13 @@ func (m *AccountManager) AddAccount(account Account) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if existing, ok := m.accounts[account.UserID]; ok && len(existing.OrgSettings) > 0 {
-		account.OrgSettings = existing.OrgSettings
+	if existing, ok := m.accounts[account.UserID]; ok {
+		if len(existing.OrgSettings) > 0 {
+			account.OrgSettings = existing.OrgSettings
+		}
+		if len(existing.DeviceNameMigrations) > 0 && account.DeviceNameMigrations == nil {
+			account.DeviceNameMigrations = existing.DeviceNameMigrations
+		}
 	}
 	m.accounts[account.UserID] = account
 	return m.saveLocked()
@@ -330,5 +348,34 @@ func (m *AccountManager) UpdateAccountUserInfo(userID, username, name string) er
 		return errors.New("account does not exist")
 	}
 
+	return m.saveLocked()
+}
+
+// GetDeviceNameMigration returns the name the device olmID of userID was last
+// automatically renamed to, or "" if that was never attempted.
+func (m *AccountManager) GetDeviceNameMigration(userID, olmID string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.accounts[userID].DeviceNameMigrations[olmID]
+}
+
+// SetDeviceNameMigration records that the device olmID of userID was
+// automatically renamed to name (successfully or not).
+func (m *AccountManager) SetDeviceNameMigration(userID, olmID, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	account, ok := m.accounts[userID]
+	if !ok {
+		return errors.New("account does not exist")
+	}
+	migrations := make(map[string]string, len(account.DeviceNameMigrations)+1)
+	for id, n := range account.DeviceNameMigrations {
+		migrations[id] = n
+	}
+	migrations[olmID] = name
+	account.DeviceNameMigrations = migrations
+	m.accounts[userID] = account
 	return m.saveLocked()
 }

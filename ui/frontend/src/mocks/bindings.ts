@@ -124,6 +124,7 @@ const settings: Settings = {
   openAtLogin: true, autoConnect: false, dnsOverride: true, dnsTunnel: false,
   primaryDns: "", secondaryDns: "", mtu: "1280", exitNodeTakesPrecedence: false,
   autoDownloadUpdates: false,
+  deviceName: "", deviceNameDefault: "milos-thinkpad",
   autoDownloadUpdatesUnavailable: params.has("aur")
     ? "Pangolin was installed from the AUR. Update the pangolin-client-bin package with your AUR helper, for example: yay -Syu pangolin-client-bin"
     : "",
@@ -189,10 +190,18 @@ export const PreferencesService = {
     login: params.has("step") ? { id: 1, hostname: params.get("renew") ?? "", userId: "" } : null,
   }),
   Update: (f: Settings) => {
-    Object.assign(settings, f);
+    const none = { deviceNameStatus: "", deviceNameStatusKind: "" };
+    if (f.deviceName.trim().length > 255)
+      return ok({ settings: { ...settings }, field: "deviceName", error: "Enter at most 255 characters", ...none });
+    const renamed = f.deviceName.trim() !== settings.deviceName;
+    Object.assign(settings, f, { deviceName: f.deviceName.trim() });
     if (!/^\d+$/.test(f.mtu) || +f.mtu < 576 || +f.mtu > 9000)
-      return ok({ settings: { ...settings, mtu: "1280" }, field: "mtu", error: "Enter an integer between 576 and 9000 (e.g., 1280)" });
-    return ok({ settings: { ...settings }, field: "", error: "" });
+      return ok({ settings: { ...settings, mtu: "1280" }, field: "mtu", error: "Enter an integer between 576 and 9000 (e.g., 1280)", ...none });
+    // `?member` previews a role without the updateClient permission.
+    const status = !renamed ? none : params.has("member")
+      ? { deviceNameStatus: "Saved. Renaming devices on the server needs an administrator (the updateClient permission); ask one to rename this device.", deviceNameStatusKind: "warning" }
+      : { deviceNameStatus: "Renamed on the server.", deviceNameStatusKind: "ok" };
+    return ok({ settings: { ...settings }, field: "", error: "", ...status });
   },
   Refresh: () => ok({ ...settings }),
   SetSettingsActive: (v: boolean) => ok(log("settings active", v)),

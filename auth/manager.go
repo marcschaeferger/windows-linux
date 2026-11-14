@@ -78,6 +78,16 @@ type AuthManager struct {
 	// code (0 when none); deviceAuthSeq numbers the attempts.
 	deviceAuthOwner uint64
 	deviceAuthSeq   uint64
+
+	// deviceNameMigrating is held while a background device rename runs.
+	deviceNameMigrating sync.Mutex
+	// deviceNameRenaming serializes renames on the server, so a background
+	// rename can't overwrite a name the user just chose.
+	deviceNameRenaming sync.Mutex
+	// cancelMigration stops the running background rename (nil if none);
+	// guarded by cancelMigrationMu.
+	cancelMigrationMu sync.Mutex
+	cancelMigration   context.CancelFunc
 }
 
 // NewAuthManager creates a new AuthManager instance
@@ -281,8 +291,8 @@ func (am *AuthManager) LoginWithDeviceAuth(ctx context.Context, hostnameOverride
 	loginClient := api.NewAPIClient(baseURL, "")
 	loginClient.SetSessionCookieName(am.configManager.GetSessionCookieName())
 
-	// Get friendly device name (e.g., "Windows Laptop" or "Windows Desktop")
-	deviceName := config.GetFriendlyDeviceName()
+	// The name the user set, or else the computer's hostname
+	deviceName := am.configManager.EffectiveDeviceName()
 
 	// Start device auth
 	startResponse, err := loginClient.StartDeviceAuthContext(ctx, "Pangolin "+version.OSDisplayName+" Client", &deviceName)
@@ -901,6 +911,7 @@ func (am *AuthManager) EnsureOlmCredentials(userId string) error {
 			switch {
 			case err == nil && olm != nil && olm.OlmId == olmIdString:
 				logger.Info("Auth: OLM credentials verified (userId=%s)", userId)
+				am.startDeviceNameMigration(userId)
 				return nil
 			case err == nil && olm != nil:
 				logger.Error("Auth: OLM ID mismatch (userId=%s, server=%s, stored=%s)", userId, olm.OlmId, olmIdString)
@@ -933,6 +944,8 @@ func (am *AuthManager) EnsureOlmCredentials(userId string) error {
 			return errors.New("failed to save OLM credentials")
 		}
 		logger.Info("Auth: recovered OLM credentials (userId=%s)", userId)
+		// Recovery reuses the device's olm, which keeps its old name.
+		am.startDeviceNameMigration(userId)
 		return nil
 	}
 	if !isNotFoundError(err) {
@@ -941,7 +954,7 @@ func (am *AuthManager) EnsureOlmCredentials(userId string) error {
 	}
 	logger.Info("Auth: no OLM matches this device fingerprint, creating a new one (userId=%s)", userId)
 
-	deviceName := config.GetFriendlyDeviceName()
+	deviceName := am.configManager.EffectiveDeviceName()
 	olmResponse, err := am.apiClient.CreateOlm(userId, deviceName)
 	if err != nil {
 		logger.Error("Auth: failed to create OLM (userId=%s): %v", userId, err)

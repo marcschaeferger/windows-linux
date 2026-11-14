@@ -50,6 +50,9 @@ type Config struct {
 	CheckForUpdatesButtonEnabled *bool    `json:"checkForUpdatesButtonEnabled,omitempty"`
 	UpdateCheckIntervalSeconds   *int     `json:"updateCheckIntervalSeconds,omitempty"`
 	AutoDownloadUpdatesEnabled   *bool    `json:"autoDownloadUpdatesEnabled,omitempty"`
+	// DeviceName overrides the name this device registers under on the
+	// server. Unset or empty means the computer's hostname (DefaultDeviceName).
+	DeviceName *string `json:"deviceName,omitempty"`
 
 	// Orgs holds per-org overrides, keyed by org ID. Precedence when connecting
 	// to an org: server settings > its entry here > the global settings above.
@@ -964,6 +967,10 @@ func mergeConfig(base, override *Config) *Config {
 		v := *override.AutoDownloadUpdatesEnabled
 		merged.AutoDownloadUpdatesEnabled = &v
 	}
+	if override.DeviceName != nil {
+		v := *override.DeviceName
+		merged.DeviceName = &v
+	}
 	if override.OnboardingSeenWelcome != nil {
 		v := *override.OnboardingSeenWelcome
 		merged.OnboardingSeenWelcome = &v
@@ -1069,6 +1076,10 @@ func copyConfig(src *Config) *Config {
 		autoDownloadUpdatesEnabled := *src.AutoDownloadUpdatesEnabled
 		cfg.AutoDownloadUpdatesEnabled = &autoDownloadUpdatesEnabled
 	}
+	if src.DeviceName != nil {
+		deviceName := *src.DeviceName
+		cfg.DeviceName = &deviceName
+	}
 	if src.OnboardingSeenWelcome != nil {
 		onboardingSeenWelcome := *src.OnboardingSeenWelcome
 		cfg.OnboardingSeenWelcome = &onboardingSeenWelcome
@@ -1080,8 +1091,9 @@ func copyConfig(src *Config) *Config {
 	return cfg
 }
 
-// GetFriendlyDeviceName returns a friendly device name like "Windows Laptop"
-// or "Linux Desktop", using battery presence to tell laptops apart.
+// GetFriendlyDeviceName returns a generic device name like "Windows Laptop"
+// or "Linux Desktop", using battery presence to tell laptops apart. It is only
+// the fallback for DefaultDeviceName when the hostname is unusable.
 func GetFriendlyDeviceName() string {
 	if isLaptop() {
 		return version.OSDisplayName + " Laptop"

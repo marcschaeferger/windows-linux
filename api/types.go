@@ -161,6 +161,8 @@ type Olm struct {
 	Name    *string `json:"name,omitempty"`
 	Secret  *string `json:"secret,omitempty"`
 	Blocked *bool   `json:"blocked,omitempty"`
+	// ClientId is the client the olm last connected through (one org's).
+	ClientId *int `json:"clientId,omitempty"`
 }
 
 // MyDeviceResponse represents the response for getting my device
@@ -199,4 +201,32 @@ type ListSiteResourcesResponse struct {
 // org manages for the current user
 type MyClientSettingsResponse struct {
 	Settings *config.ClientSettings `json:"settings"`
+}
+
+// UpdateClientRequest is the body of POST /client/:clientId. Only the name is
+// sent: the server rejects unknown fields.
+type UpdateClientRequest struct {
+	Name string `json:"name"`
+}
+
+// ListUserOlmsResponse is the inner `data` of GET /user/:userId/olms.
+type ListUserOlmsResponse struct {
+	Olms       []Olm `json:"olms"`
+	Pagination *struct {
+		Total int `json:"total"`
+	} `json:"pagination,omitempty"`
+}
+
+// UserDevice is the (partial) shape of an entry returned by
+// GET /org/:orgId/user-devices.
+type UserDevice struct {
+	ClientId int     `json:"clientId"`
+	OrgId    string  `json:"orgId"`
+	Name     string  `json:"name"`
+	UserId   *string `json:"userId,omitempty"`
+}
+
+// ListUserDevicesResponse is the inner `data` of GET /org/:orgId/user-devices.
+type ListUserDevicesResponse struct {
+	Devices []UserDevice `json:"devices"`
 }

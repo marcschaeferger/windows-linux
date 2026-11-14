@@ -245,6 +245,17 @@ export interface Settings {
     "autoDownloadUpdatesUnavailable": string;
 
     /**
+     * DeviceName is the name the user chose for this device on the server, or
+     * empty to use the computer's hostname. It is an application setting.
+     */
+    "deviceName": string;
+
+    /**
+     * DeviceNameDefault is the name used when DeviceName is empty.
+     */
+    "deviceNameDefault": string;
+
+    /**
      * Disabled is set when an administrator has turned off user settings.
      */
     "disabled": boolean;
@@ -275,12 +286,24 @@ export interface Settings {
 /**
  * SettingsResult is the outcome of applying a settings change. On a
  * validation error nothing is saved and Field names the invalid field
- * ("mtu", "primaryDns" or "secondaryDns") so the sheet can show Error inline.
+ * ("mtu", "primaryDns", "secondaryDns" or "deviceName") so the sheet can show
+ * Error inline.
  */
 export interface SettingsResult {
     "settings": Settings;
     "field": string;
     "error": string;
+
+    /**
+     * DeviceNameStatus describes renaming the device on the server after the
+     * device name changed; empty when it didn't change.
+     */
+    "deviceNameStatus": string;
+
+    /**
+     * DeviceNameStatusKind is "ok", "warning" or "error".
+     */
+    "deviceNameStatusKind": string;
 }
 
 /**
