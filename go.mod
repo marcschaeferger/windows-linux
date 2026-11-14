@@ -2,6 +2,8 @@ module github.com/fosrl/windows-linux
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3
 	github.com/Microsoft/go-winio v0.6.4
