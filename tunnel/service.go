@@ -132,6 +132,7 @@ type Config struct {
 }
 
 func StartTunnel(config Config) error {
+	config.RegisterSecrets()
 	logger.Info("Tunnel: StartTunnel called")
 
 	// Log the config

@@ -48,7 +48,7 @@ the same gob IPC protocol, so everything above the transport is shared.
 
 | Package | Role | Per-OS files |
 | --- | --- | --- |
-| `main` | role dispatch, logging (`logger.go`, daily rotation, 3 days kept) | `main_windows.go`, `main_linux.go` |
+| `main` | role dispatch, logging (`logger.go`; the daemon / manager service rotates the shared log by size, tunnels and UIs only follow) | `main_windows.go`, `main_linux.go` |
 | `api` | Pangolin server HTTP client (session cookie, 401 → session expired) | – |
 | `auth` | login flow, accounts, OLM credential lifecycle, device posture IPC | – |
 | `config` | `pangolin.json` user + machine config, accounts, paths, server client-settings | `paths_*.go` |
@@ -198,13 +198,15 @@ safely with `O_NOFOLLOW`, regular file owned by that UID, 1 MiB cap
 
 | | Windows | Linux |
 | --- | --- | --- |
-| Logs (manager, tunnels) | `%ProgramData%\Pangolin\logs\pangolin.log` | `/var/log/pangolin-client/pangolin.log` |
-| Logs (UI) | same file | `~/.local/state/pangolin-client/logs/pangolin.log` |
+| Logs (manager, tunnels) | `%ProgramData%\Pangolin\logs\pangolin.log` (SYSTEM+Admins ACL) | `/var/log/pangolin-client/pangolin.log` (root only, 0640 in a 0750 dir) |
+| Logs (UI) | `%LOCALAPPDATA%\Pangolin\logs\pangolin.log` | `~/.local/state/pangolin-client/logs/pangolin.log` |
 | Secrets | `%ProgramData%\Pangolin\Credentials\<SID>\<userId>.secrets.dpapi` (SYSTEM+Admins ACL, DPAPI) | `/var/lib/pangolin-client/credentials/<uid>/<userId>.secrets.json` (root-only) |
 | Staged update | `%ProgramData%\Pangolin\updates\pending.msi` + `pending.sig` | `/var/lib/pangolin-client/updates/pending.<ext>` + `pending.sig` |
 | Relaunch-after-update list | restart-ui flag file (updater) | `/var/lib/pangolin-client/restart-ui-after-update` (UIDs) |
 | Runtime | named pipes | `/run/pangolin-client/` (manager.sock, olm.sock, tunnels/) |
 | WebView data | `%LOCALAPPDATA%\Pangolin\WebView2` | WebKitGTK default |
 
-The Logs tab shows the manager/daemon log on Linux (where tunnel problems show
-up), not the UI log.
+The Logs tab shows the manager/daemon log (where tunnel problems show up), not
+the UI log. Users can't read that file, so the tab reads it through the daemon
+(`ReadLog` IPC). Every log line is redacted (`logging.Redact`) before it is
+written, and again when the tab shows, copies or exports it.

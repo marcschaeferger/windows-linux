@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/fosrl/windows-linux/logging"
 )
 
 // LogLine is a single parsed log line shown in the Logs tab.
@@ -18,7 +20,7 @@ const logStampFormat = "2006-01-02 15:04:05.000"
 
 // String formats the line the way Copy and Save write it.
 func (l LogLine) String() string {
-	return fmt.Sprintf("%s [%s] %s\r\n", l.Stamp.Format(logStampFormat), l.Level, l.Line)
+	return fmt.Sprintf("%s [%s] %s\r\n", l.Stamp.Format(logStampFormat), l.Level, logging.Redact(l.Line))
 }
 
 var (
@@ -37,7 +39,7 @@ var (
 // parseLogLine parses a log line in one of the supported formats. Lines in no
 // known format get the current time and level UNKNOWN.
 func parseLogLine(line string) *LogLine {
-	line = strings.TrimSpace(line)
+	line = strings.TrimSpace(logging.Redact(line))
 	if line == "" {
 		return nil
 	}
